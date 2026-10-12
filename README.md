@@ -7,13 +7,13 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE.md)
 [![MCP Protocol](https://img.shields.io/badge/MCP-Model_Context_Protocol-purple.svg?style=flat-square)](https://modelcontextprotocol.io/)
 
-A production pyRevit extension and companion Flask-based Model Context Protocol (MCP) server that connects autonomous AI agents (Claude, Gemini, Antigravity, custom LLMs) directly into an **active Autodesk Revit session**.
+A pyRevit extension and companion Flask-based Model Context Protocol (MCP) server that connects autonomous AI agents (Claude, Gemini, Antigravity, custom LLMs) directly into an **active Autodesk Revit session**.
 
 Instead of copy-pasting data or relying on static script runs, the agent can inspect your model schema, query elements, format schedules, modify family types, and execute safe, atomic Revit API transactions in real time.
 
 ---
 
-## 🌟 Key Features
+## Key Features
 
 * **Live Session Automation:** Bridges modern LLM reasoning directly to Revit without requiring full standalone add-in recompilation.
 * **Atomic Revit API Transactions:** Safely executes Python / Revit API code through pyRevit routes inside controlled `Transaction` blocks.
@@ -28,7 +28,7 @@ Instead of copy-pasting data or relying on static script runs, the agent can ins
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```
 ┌─────────────────────────────────┐
@@ -50,12 +50,12 @@ Instead of copy-pasting data or relying on static script runs, the agent can ins
 │   (startup.py inside Revit.exe) │
 │  - Transaction management       │
 │  - Revit API Execution Engine   │
-└────────────────┘
+└─────────────────────────────────┘
 ```
 
 ---
 
-## 🚀 Quick Start & Installation
+## Quick Start & Installation
 
 ### 1. Prerequisites
 * **Autodesk Revit 2024** (or compatible 2023+ release)
@@ -70,9 +70,9 @@ git clone https://github.com/Hazemalisakr/pyRevit-MCP-Server-Bridge.git "C:\pyRe
 ```
 
 In Revit:
-1. Navigate to **pyRevit tab → Settings → Custom Extension Directories**.
+1. Navigate to **pyRevit tab -> Settings -> Custom Extension Directories**.
 2. Add the parent folder (e.g. `C:\pyRevitExtensions`).
-3. Click **Save Settings** and **pyRevit → Reload**.
+3. Click **Save Settings** and **pyRevit -> Reload**.
 4. You will see the **RevitMCP** tab appear on your ribbon.
 
 ### 3. Install Server Dependencies
@@ -85,7 +85,7 @@ pip install -r requirements.txt
 Optional: Copy `.env.example` to `.env` to configure custom host/port settings.
 
 ### 4. Start the Bridge
-* **From Revit Ribbon:** Click **RevitMCP tab → Server panel → Launch RevitMCP**.
+* **From Revit Ribbon:** Click **RevitMCP tab -> Server panel -> Launch RevitMCP**.
 * **Or via Terminal:**
   ```bash
   python lib/RevitMCP_ExternalServer/server.py --surface mcp
@@ -94,7 +94,7 @@ Optional: Copy `.env.example` to `.env` to configure custom host/port settings.
 
 ---
 
-## 🔧 Connecting to AI Agents
+## Connecting to AI Agents
 
 ### Claude Desktop Configuration (`claude_desktop_config.json`)
 
@@ -124,7 +124,7 @@ Configure the tool definitions provided in the `routes/` schema to point to `htt
 
 ---
 
-## 🛡️ Safety & Model Integrity
+## Safety & Model Integrity
 
 * **Transactions:** All write operations run inside explicit `revit.Transaction` blocks.
 * **Group Protection:** Workflows enforce group ID checking (`element.GroupId != InvalidElementId`) so detail or model groups are never accidentally unlinked.
@@ -132,10 +132,10 @@ Configure the tool definitions provided in the `routes/` schema to point to `htt
 
 ---
 
-## 📄 License
+## License
 
 This project is licensed under the [MIT License](LICENSE.md).
 
-## 🤝 Contributing & Community
+## Contributing & Community
 
-Contributions, issues, and feature requests are welcome! Feel free to check the [issues page](https://github.com/Hazemalisakr/pyRevit-MCP-Server-Bridge/issues) or submit a pull request.
+Contributions, issues, and feature requests are welcome. Feel free to check the [issues page](https://github.com/Hazemalisakr/pyRevit-MCP-Server-Bridge/issues) or submit a pull request.
