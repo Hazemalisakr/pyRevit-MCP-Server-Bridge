@@ -1,0 +1,2093 @@
+import re
+
+from RevitMCP_ExternalServer.tools.context_tools import resolve_revit_targets_internal
+from RevitMCP_ExternalServer.tools.registry import ToolDefinition
+
+
+GET_ACTIVE_SELECTION_TOOL_NAME = "get_active_selection"
+GET_REVIT_DIAGNOSTICS_TOOL_NAME = "get_revit_diagnostics"
+GET_ELEMENTS_BY_CATEGORY_TOOL_NAME = "get_elements_by_category"
+SELECT_ELEMENTS_TOOL_NAME = "select_elements_by_id"
+SELECT_STORED_ELEMENTS_TOOL_NAME = "select_stored_elements"
+LIST_STORED_ELEMENTS_TOOL_NAME = "list_stored_elements"
+FILTER_ELEMENTS_TOOL_NAME = "filter_elements"
+FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_NAME = "filter_stored_elements_by_parameter"
+GET_ELEMENT_PROPERTIES_TOOL_NAME = "get_element_properties"
+GET_ELEMENT_RELATIONSHIPS_TOOL_NAME = "get_element_relationships"
+GET_ELEMENT_LOCATIONS_TOOL_NAME = "get_element_locations"
+GET_RELATED_ELEMENT_PROPERTIES_TOOL_NAME = "get_related_element_properties"
+UPDATE_ELEMENT_PARAMETERS_TOOL_NAME = "update_element_parameters"
+SYNC_ELEMENT_PARAMETER_VALUES_TOOL_NAME = "sync_element_parameter_values"
+
+FILTER_STRING_OPERATORS = ["contains", "equals", "not_equals", "starts_with", "ends_with"]
+FILTER_NUMERIC_OPERATORS = ["greater_than", "greater_than_or_equal", "less_than", "less_than_or_equal"]
+FILTER_OPERATORS = FILTER_STRING_OPERATORS + FILTER_NUMERIC_OPERATORS
+FILTER_MULTI_MATCH_MODES = ["any", "all"]
+
+
+def _bounded_int(value, default_value: int, min_value: int = 0, max_value: int = None) -> int:
+    try:
+        normalized = int(value if value is not None else default_value)
+    except Exception:
+        normalized = int(default_value)
+
+    normalized = max(min_value, normalized)
+    if max_value is not None:
+        normalized = min(max_value, normalized)
+    return normalized
+
+
+def get_active_selection_handler(services, limit: int = 200, **_kwargs) -> dict:
+    safe_limit = max(1, min(2000, int(limit if limit is not None else 200)))
+    services.logger.info("MCP Tool executed: %s with limit=%s", GET_ACTIVE_SELECTION_TOOL_NAME, safe_limit)
+
+    result = services.revit_client.call_listener(
+        command_path="/selection/active",
+        method="POST",
+        payload_data={"limit": safe_limit},
+    )
+
+    if result.get("status") == "success" and result.get("element_ids"):
+        stored_as, result_handle = services.result_store.store_elements(
+            "active_selection",
+            result.get("element_ids", []),
+            result.get("returned_count", len(result.get("element_ids", []))),
+        )
+        result["stored_as"] = stored_as
+        result["result_handle"] = result_handle
+        result["storage_message"] = "Selection snapshot stored as '{}' ({})".format(stored_as, result_handle)
+
+    return services.result_store.compact_result_payload(
+        result,
+        preserve_keys=[
+            "status",
+            "message",
+            "stored_as",
+            "result_handle",
+            "storage_message",
+            "total_count",
+            "returned_count",
+            "truncated",
+            "limit",
+        ],
+    )
+
+
+def get_revit_diagnostics_handler(
+    services,
+    check_write_context: bool = False,
+    selection_limit: int = 20,
+    **_kwargs,
+) -> dict:
+    safe_selection_limit = max(0, min(200, int(selection_limit if selection_limit is not None else 20)))
+    services.logger.info(
+        "MCP Tool executed: %s with check_write_context=%s selection_limit=%s",
+        GET_REVIT_DIAGNOSTICS_TOOL_NAME,
+        check_write_context,
+        safe_selection_limit,
+    )
+    result = services.revit_client.call_listener(
+        command_path="/diagnostics/revit_state",
+        method="POST",
+        payload_data={
+            "check_write_context": bool(check_write_context),
+            "selection_limit": safe_selection_limit,
+        },
+    )
+    return services.result_store.compact_result_payload(
+        result,
+        preserve_keys=[
+            "status",
+            "message",
+            "route_version",
+            "process",
+            "document_state",
+            "active_view",
+            "selection",
+            "open_documents",
+            "write_context_check",
+        ],
+    )
+
+
+def get_elements_by_category_handler(services, category_name: str, **_kwargs) -> dict:
+    services.logger.info("MCP Tool executed: %s with category_name: %s", GET_ELEMENTS_BY_CATEGORY_TOOL_NAME, category_name)
+    result = services.revit_client.call_listener(
+        command_path="/get_elements_by_category",
+        method="POST",
+        payload_data={"category_name": category_name},
+    )
+
+    if result.get("status") == "error" and "Invalid category_name" in str(result.get("message", "")):
+        suggestions = resolve_revit_targets_internal(services, {"category_name": category_name})
+        result["suggestions"] = suggestions
+        resolved_category = suggestions.get("resolved", {}).get("category_name")
+        if resolved_category:
+            result["message"] = "{} Did you mean '{}' ?".format(result.get("message", ""), resolved_category)
+
+    if result.get("status") == "success" and "element_ids" in result:
+        storage_key, result_handle = services.result_store.store_elements(
+            category_name,
+            result["element_ids"],
+            result.get("count", len(result["element_ids"])),
+        )
+        result["stored_as"] = storage_key
+        result["result_handle"] = result_handle
+        result["storage_message"] = (
+            f"Results stored as '{storage_key}' ({result_handle}) - use select_stored_elements with "
+            "category_name or result_handle"
+        )
+
+    return services.result_store.compact_result_payload(
+        result,
+        preserve_keys=["stored_as", "result_handle", "storage_message", "count", "category", "status", "message"],
+    )
+
+
+def select_elements_by_id_handler(
+    services,
+    element_ids: list[str] = None,
+    result_handle: str = None,
+    focus: bool = True,
+    refresh_view: bool = True,
+    **_kwargs,
+) -> dict:
+    services.logger.info("MCP Tool executed: %s", SELECT_ELEMENTS_TOOL_NAME)
+    resolved_ids, _record, resolve_error = services.result_store.resolve_element_ids(
+        element_ids=element_ids,
+        result_handle=result_handle,
+    )
+    if resolve_error:
+        return resolve_error
+
+    services.logger.info(
+        "select_elements_by_id_handler using %s IDs%s",
+        len(resolved_ids),
+        " from handle '{}'".format(result_handle) if result_handle else "",
+    )
+
+    if isinstance(resolved_ids, str):
+        services.logger.warning(
+            "select_elements_by_id_handler: element_ids was a string ('%s'), converting to list.",
+            resolved_ids,
+        )
+        processed_element_ids = [resolved_ids]
+    elif isinstance(resolved_ids, list) and all(isinstance(element_id, str) for element_id in resolved_ids):
+        processed_element_ids = resolved_ids
+    elif isinstance(resolved_ids, list):
+        services.logger.warning(
+            "select_elements_by_id_handler: element_ids list contained non-string items: %s. Attempting conversion.",
+            resolved_ids,
+        )
+        try:
+            processed_element_ids = [str(element_id) for element_id in resolved_ids]
+        except Exception as conversion_error:
+            services.logger.error(
+                "select_elements_by_id_handler: Failed to convert all items in element_ids to string: %s",
+                conversion_error,
+            )
+            return {
+                "status": "error",
+                "message": "Invalid format for element_ids. All IDs must be strings. Received: {}".format(resolved_ids),
+            }
+    else:
+        services.logger.error(
+            "select_elements_by_id_handler: invalid element_ids type %s value %s",
+            type(resolved_ids),
+            resolved_ids,
+        )
+        return {
+            "status": "error",
+            "message": "Invalid input type for element_ids. Expected string or list of strings. Received: {}".format(
+                type(resolved_ids)
+            ),
+        }
+
+    result = services.revit_client.call_listener(
+        command_path="/select_elements_by_id",
+        method="POST",
+        payload_data={
+            "element_ids": processed_element_ids,
+            "focus": bool(focus),
+            "refresh_view": bool(refresh_view),
+        },
+    )
+    if result.get("status") == "success" and result_handle:
+        result["result_handle"] = result_handle
+    return services.result_store.compact_result_payload(result)
+
+
+def select_stored_elements_handler(
+    services,
+    category_name: str = None,
+    result_handle: str = None,
+    **_kwargs,
+) -> dict:
+    services.logger.info(
+        "MCP Tool executed: %s with category_name: %s, result_handle: %s",
+        SELECT_STORED_ELEMENTS_TOOL_NAME,
+        category_name,
+        result_handle,
+    )
+
+    stored_data = None
+    normalized_category = None
+    if result_handle:
+        stored_data = services.result_store.get_result_by_handle(result_handle)
+        if not stored_data:
+            return {
+                "status": "error",
+                "message": "No stored elements found for result_handle '{}'.".format(result_handle),
+                "available_categories": list(services.result_store.element_storage.keys()),
+            }
+        normalized_category = stored_data.get("storage_key", stored_data.get("category", "unknown"))
+    elif category_name:
+        normalized_category = category_name.lower().replace("ost_", "").replace(" ", "_")
+        stored_data = services.result_store.get_stored_elements(normalized_category)
+    else:
+        return {"status": "error", "message": "Provide either category_name or result_handle."}
+
+    if not stored_data and category_name:
+        available_keys = list(services.result_store.element_storage.keys())
+        potential_matches = [key for key in available_keys if key.startswith(normalized_category)]
+        if potential_matches:
+            best_match = potential_matches[-1]
+            stored_data = services.result_store.get_stored_elements(best_match)
+            services.logger.info("Found partial match: '%s' for category '%s'", best_match, category_name)
+        else:
+            fuzzy_matches = [key for key in available_keys if normalized_category in key]
+            if fuzzy_matches:
+                best_match = fuzzy_matches[-1]
+                stored_data = services.result_store.get_stored_elements(best_match)
+                services.logger.info("Found fuzzy match: '%s' for category '%s'", best_match, category_name)
+
+    if not stored_data:
+        available_keys = list(services.result_store.element_storage.keys())
+        return {
+            "status": "error",
+            "message": "No stored elements found for category '{}'. Available stored categories: {}".format(
+                category_name or result_handle,
+                available_keys,
+            ),
+            "available_categories": available_keys,
+            "suggestion": "Try using list_stored_elements to see all available categories, or use the exact storage key name.",
+        }
+
+    element_ids = stored_data["element_ids"]
+    total_elements = len(element_ids)
+    services.logger.info("Using %s stored element IDs for category '%s'", total_elements, category_name)
+
+    if total_elements > services.config.max_elements_for_selection:
+        services.logger.warning(
+            "Selection aborted: %s elements exceeds safe limit of %s",
+            total_elements,
+            services.config.max_elements_for_selection,
+        )
+        return {
+            "status": "limit_exceeded",
+            "message": (
+                f"Selection would include {total_elements} elements which exceeds the safe limit of "
+                f"{services.config.max_elements_for_selection}."
+            ),
+            "suggestion": "Please narrow your criteria (e.g., filter by level or parameter) before selecting.",
+            "stored_count": stored_data.get("count", total_elements),
+            "stored_key": stored_data.get("category", category_name),
+            "selection_limit": services.config.max_elements_for_selection,
+        }
+
+    result = services.revit_client.call_listener(
+        command_path="/select_elements_focused",
+        method="POST",
+        payload_data={"element_ids": element_ids, "focus": True, "refresh_view": True},
+    )
+    if result.get("status") == "error":
+        if services.revit_client.is_route_not_defined(result, "/select_elements_focused") or "select_elements_focused" in str(
+            result.get("message", "")
+        ):
+            services.logger.warning(
+                "Route '/select_elements_focused' is not available on the active Revit API. Falling back to '/select_elements_by_id'."
+            )
+            fallback_result = services.revit_client.call_listener(
+                command_path="/select_elements_by_id",
+                method="POST",
+                payload_data={"element_ids": element_ids, "focus": True, "refresh_view": True},
+            )
+            if fallback_result.get("status") == "success":
+                fallback_result["approach_note"] = "Fallback selection used because focused selection route was unavailable"
+            result = fallback_result
+
+    if result.get("status") == "success":
+        result["source"] = "stored_{}".format(category_name or normalized_category)
+        result["stored_count"] = stored_data["count"]
+        result["stored_at"] = stored_data["timestamp"]
+        result["matched_key"] = stored_data.get("category", "unknown")
+        result["result_handle"] = stored_data.get("result_handle")
+        result["approach_note"] = "Focused selection - elements should remain active for user operations"
+
+    return services.result_store.compact_result_payload(result)
+
+
+def list_stored_elements_handler(services, **_kwargs) -> dict:
+    services.logger.info("MCP Tool executed: %s", LIST_STORED_ELEMENTS_TOOL_NAME)
+    stored_categories = services.result_store.list_stored_categories()
+    return {
+        "status": "success",
+        "message": "Found {} stored categories".format(len(stored_categories)),
+        "stored_categories": stored_categories,
+        "total_categories": len(stored_categories),
+    }
+
+
+def filter_elements_handler(
+    services,
+    category_name: str,
+    level_name: str = None,
+    parameters: list = None,
+    **_kwargs,
+) -> dict:
+    services.logger.info(
+        "MCP Tool executed: %s with category: %s, level: %s, parameters: %s",
+        FILTER_ELEMENTS_TOOL_NAME,
+        category_name,
+        level_name,
+        parameters,
+    )
+
+    normalized_parameters = []
+    for parameter in parameters or []:
+        if not isinstance(parameter, dict):
+            return {"status": "error", "message": "Each parameter filter must be an object."}
+
+        normalized_parameter = dict(parameter)
+        raw_operator = normalized_parameter.get("operator", normalized_parameter.get("condition"))
+        normalized_operator = _normalize_filter_operator(raw_operator)
+        if raw_operator is not None and normalized_operator is None:
+            return {
+                "status": "error",
+                "message": "Unsupported filter operator '{}'. Supported operators: {}.".format(
+                    raw_operator,
+                    ", ".join(FILTER_OPERATORS),
+                ),
+            }
+        normalized_parameter["condition"] = normalized_operator or "equals"
+        normalized_parameters.append(normalized_parameter)
+
+    parameters = normalized_parameters
+
+    resolution = resolve_revit_targets_internal(
+        services,
+        {
+            "category_name": category_name,
+            "level_name": level_name,
+            "parameter_names": [
+                parameter.get("name")
+                for parameter in (parameters or [])
+                if isinstance(parameter, dict) and parameter.get("name")
+            ],
+        },
+    )
+    if resolution.get("status") != "error":
+        resolved_payload = resolution.get("resolved", {})
+        if resolved_payload.get("category_name"):
+            category_name = resolved_payload["category_name"]
+        if resolved_payload.get("level_name"):
+            level_name = resolved_payload["level_name"]
+        param_map = resolved_payload.get("parameter_names", {})
+        if param_map and isinstance(parameters, list):
+            for parameter in parameters:
+                if isinstance(parameter, dict) and parameter.get("name") in param_map:
+                    mapped = param_map[parameter["name"]]
+                    resolved_name = mapped.get("resolved_name", parameter["name"])
+                    confidence = float(mapped.get("confidence", 0.0))
+                    if confidence >= services.config.min_confidence_for_parameter_remap:
+                        parameter["name"] = resolved_name
+                    else:
+                        services.logger.info(
+                            "Skipping low-confidence parameter remap for '%s' -> '%s' (confidence=%s)",
+                            parameter["name"],
+                            resolved_name,
+                            confidence,
+                        )
+
+    payload = {"category_name": category_name}
+    if level_name:
+        payload["level_name"] = level_name
+    if parameters:
+        payload["parameters"] = parameters
+
+    result = services.revit_client.call_listener(command_path="/elements/filter", method="POST", payload_data=payload)
+
+    if result.get("status") == "error":
+        error_message = str(result.get("message", ""))
+        if "Invalid category_name" in error_message or "Level '" in error_message:
+            resolver_input = {
+                "category_name": category_name,
+                "level_name": level_name,
+                "parameter_names": [
+                    parameter.get("name")
+                    for parameter in (parameters or [])
+                    if isinstance(parameter, dict) and parameter.get("name")
+                ],
+            }
+            suggestions = resolve_revit_targets_internal(services, resolver_input)
+            result["suggestions"] = suggestions
+            if "Invalid category_name" in error_message:
+                resolved_category = suggestions.get("resolved", {}).get("category_name")
+                alt_categories = suggestions.get("alternatives", {}).get("category_name", [])
+                if resolved_category:
+                    result["message"] = "{} Did you mean '{}' ?".format(error_message, resolved_category)
+                elif alt_categories:
+                    result["message"] = "{} Available categories include: {}".format(error_message, ", ".join(alt_categories[:10]))
+            if "Level '" in error_message:
+                resolved_level = suggestions.get("resolved", {}).get("level_name")
+                alt_levels = suggestions.get("alternatives", {}).get("level_name", [])
+                if resolved_level:
+                    result["message"] = "{} Did you mean level '{}' ?".format(result.get("message", error_message), resolved_level)
+                elif alt_levels:
+                    result["message"] = "{} Available levels include: {}".format(
+                        result.get("message", error_message),
+                        ", ".join(alt_levels[:10]),
+                    )
+
+    if result.get("status") == "error" and services.revit_client.is_route_not_defined(result, "/elements/filter"):
+        if not level_name and not parameters:
+            services.logger.warning(
+                "Route '/elements/filter' missing. Falling back to '/get_elements_by_category' for category-only request."
+            )
+            result = services.revit_client.call_listener(
+                command_path="/get_elements_by_category",
+                method="POST",
+                payload_data={"category_name": category_name},
+            )
+        else:
+            return {
+                "status": "error",
+                "error_type": "route_not_defined",
+                "message": "The active Revit route set does not support '/elements/filter'. Reload/update the Revit extension to use advanced filtering.",
+            }
+
+    if result.get("status") == "success" and "element_ids" in result:
+        storage_key = category_name.lower().replace("ost_", "").replace(" ", "_")
+        if level_name:
+            storage_key += f"_level_{level_name.lower()}"
+        if parameters:
+            storage_key += "_filtered"
+
+        stored_key, result_handle = services.result_store.store_elements(
+            storage_key,
+            result["element_ids"],
+            result.get("count", len(result["element_ids"])),
+        )
+        result["stored_as"] = stored_key
+        result["result_handle"] = result_handle
+        result["storage_message"] = (
+            f"Filtered results stored as '{stored_key}' ({result_handle}) - use select_stored_elements with "
+            "category_name or result_handle"
+        )
+
+    return services.result_store.compact_result_payload(
+        result,
+        preserve_keys=["stored_as", "result_handle", "storage_message", "count", "category", "status", "message"],
+    )
+
+
+def _collapse_whitespace(value):
+    return re.sub(r"\s+", " ", str(value or "").replace(u"\u00A0", " ")).strip()
+
+
+def _normalize_filter_operator(operator):
+    alias_map = {
+        None: "contains",
+        "": "contains",
+        "contains": "contains",
+        "equals": "equals",
+        "==": "equals",
+        "not_equals": "not_equals",
+        "not equal": "not_equals",
+        "!=": "not_equals",
+        "starts_with": "starts_with",
+        "ends_with": "ends_with",
+        "greater_than": "greater_than",
+        ">": "greater_than",
+        "greater_than_or_equal": "greater_than_or_equal",
+        ">=": "greater_than_or_equal",
+        "less_than": "less_than",
+        "<": "less_than",
+        "less_than_or_equal": "less_than_or_equal",
+        "<=": "less_than_or_equal",
+    }
+    return alias_map.get(str(operator or "").strip().lower())
+
+
+def _is_numeric_operator(operator):
+    return operator in FILTER_NUMERIC_OPERATORS
+
+
+def _compare_numeric_values(candidate_value, expected_value, operator):
+    if operator == "greater_than":
+        return candidate_value > expected_value
+    if operator == "greater_than_or_equal":
+        return candidate_value >= expected_value
+    if operator == "less_than":
+        return candidate_value < expected_value
+    if operator == "less_than_or_equal":
+        return candidate_value <= expected_value
+    return False
+
+
+def _convert_length_magnitude_to_internal_feet(magnitude, unit):
+    if unit in ("millimeters", "millimeter", "mm"):
+        return magnitude / 304.8
+    if unit in ("centimeters", "centimeter", "cm"):
+        return magnitude / 30.48
+    if unit in ("meters", "meter", "m"):
+        return magnitude / 0.3048
+    if unit in ("inches", "inch", "in"):
+        return magnitude / 12.0
+    if unit in ("feet", "foot", "ft"):
+        return magnitude
+    return magnitude
+
+
+def _infer_length_unit(value):
+    value_str = _collapse_whitespace(value).lower()
+    if not value_str:
+        return None
+    if "'" in value_str or '"' in value_str:
+        return "ft"
+
+    unit_match = re.search(
+        r"[-+]?\d[\d,]*(?:\.\d+)?\s*(millimeters|millimeter|mm|centimeters|centimeter|cm|meters|meter|m|feet|foot|ft|inches|inch|in)\b",
+        value_str,
+    )
+    if unit_match:
+        return unit_match.group(1)
+    return None
+
+
+def _parse_length_to_internal_feet(value, default_unit=None):
+    value_str = _collapse_whitespace(value)
+    if not value_str:
+        raise ValueError("Length value is empty.")
+
+    if "'" in value_str or '"' in value_str:
+        feet = 0.0
+        inches = 0.0
+
+        if "'" in value_str:
+            feet_part = value_str.split("'")[0].strip()
+            feet = float(feet_part) if feet_part else 0.0
+
+        if '"' in value_str:
+            inches_part = value_str
+            if "'" in value_str:
+                inches_part = value_str.split("'")[1]
+            inches_part = inches_part.replace('"', '').strip()
+            inches = float(inches_part) if inches_part else 0.0
+
+        return feet + (inches / 12.0)
+
+    normalized_value = value_str.lower().replace(",", "")
+    unit_match = re.match(
+        r"^([-+]?\d*\.?\d+)\s*(millimeters|millimeter|mm|centimeters|centimeter|cm|meters|meter|m|feet|foot|ft|inches|inch|in)?$",
+        normalized_value,
+    )
+    if not unit_match:
+        return float(value_str)
+
+    magnitude = float(unit_match.group(1))
+    unit = unit_match.group(2)
+    if not unit:
+        unit = default_unit
+
+    return _convert_length_magnitude_to_internal_feet(magnitude, unit)
+
+
+def _matches_filter_value(candidate_value, expected_value, operator="equals", case_sensitive=False, typed_value=None):
+    candidate = "" if candidate_value in (None, "Not available") else str(candidate_value)
+    expected = "" if expected_value is None else str(expected_value)
+    normalized_operator = _normalize_filter_operator(operator)
+    if not normalized_operator:
+        return False, "Unsupported filter operator '{}'. Supported operators: {}.".format(
+            operator,
+            ", ".join(FILTER_OPERATORS),
+        )
+
+    if _is_numeric_operator(normalized_operator):
+        numeric_candidate = None
+        storage_type = None
+        default_length_unit = None
+        if isinstance(typed_value, dict):
+            storage_type = typed_value.get("storage_type")
+            default_length_unit = _infer_length_unit(typed_value.get("display_value"))
+            if typed_value.get("is_numeric") and typed_value.get("numeric_value") is not None:
+                numeric_candidate = float(typed_value.get("numeric_value"))
+        if not default_length_unit:
+            default_length_unit = _infer_length_unit(candidate)
+
+        if numeric_candidate is None:
+            return False, "Parameter value is not numeric/filterable with operator '{}'.".format(normalized_operator)
+
+        try:
+            if str(storage_type or "").endswith("Double"):
+                expected_numeric = _parse_length_to_internal_feet(expected, default_unit=default_length_unit)
+            else:
+                expected_numeric = float(_collapse_whitespace(expected))
+        except Exception:
+            return (
+                False,
+                "Could not parse numeric filter value '{}'. Use a plain number or an explicit length such as 2000 mm, 2 m, or 6' 6\".".format(
+                    expected
+                ),
+            )
+
+        return _compare_numeric_values(numeric_candidate, float(expected_numeric), normalized_operator), None
+
+    if not case_sensitive:
+        candidate_cmp = candidate.lower()
+        expected_cmp = expected.lower()
+    else:
+        candidate_cmp = candidate
+        expected_cmp = expected
+
+    if normalized_operator in ("contains",):
+        return expected_cmp in candidate_cmp, None
+    if normalized_operator in ("equals", "=="):
+        return candidate_cmp == expected_cmp, None
+    if normalized_operator in ("not_equals", "!=", "not equal"):
+        return candidate_cmp != expected_cmp, None
+    if normalized_operator in ("starts_with",):
+        return candidate_cmp.startswith(expected_cmp), None
+    if normalized_operator in ("ends_with",):
+        return candidate_cmp.endswith(expected_cmp), None
+    return False, "Unsupported filter operator '{}'.".format(operator)
+
+
+def _normalize_filter_values(value=None, values=None) -> list[str]:
+    normalized_values = []
+    if value is not None:
+        normalized_values.append(str(value))
+    if isinstance(values, list):
+        normalized_values.extend([str(item) for item in values if item is not None])
+
+    deduped_values = []
+    seen = set()
+    for candidate in normalized_values:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        deduped_values.append(candidate)
+    return deduped_values
+
+
+def _normalize_text_list(values) -> list[str]:
+    if not isinstance(values, list):
+        return []
+
+    normalized = []
+    seen = set()
+    for value in values:
+        text = _collapse_whitespace(value)
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(text)
+    return normalized
+
+
+def _normalize_sync_target_policy(value) -> str | None:
+    text = _collapse_whitespace(value or "missing_only").lower()
+    if text in ("missing_only", "missing", "only_missing", "only_blanks", "blanks_only", "blank_only"):
+        return "missing_only"
+    if text in ("overwrite_all", "all", "overwrite", "replace_all"):
+        return "overwrite_all"
+    return None
+
+
+def _normalize_sync_conflict_policy(value) -> str | None:
+    text = _collapse_whitespace(value or "use_first").lower()
+    if text in ("use_first", "first", "first_populated", "write_first"):
+        return "use_first"
+    if text in ("skip", "skip_conflicts", "skip_ambiguous", "ambiguous_skip"):
+        return "skip"
+    return None
+
+
+def _normalize_sync_source_strategy(value) -> str | None:
+    text = _collapse_whitespace(value or "first_populated").lower()
+    if text in ("first_populated", "coalesce", "first_available", "first_non_blank"):
+        return "first_populated"
+    return None
+
+
+def filter_stored_elements_by_parameter_handler(
+    services,
+    parameter_name: str,
+    value: str = None,
+    values: list[str] = None,
+    operator: str = "equals",
+    match_mode: str = "any",
+    result_handle: str = None,
+    category_name: str = None,
+    batch_size: int = None,
+    case_sensitive: bool = False,
+    **_kwargs,
+) -> dict:
+    services.logger.info(
+        (
+            "MCP Tool executed: %s (parameter=%s, operator=%s, value=%s, values=%s, match_mode=%s, "
+            "result_handle=%s, category_name=%s, batch_size=%s)"
+        ),
+        FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_NAME,
+        parameter_name,
+        operator,
+        value,
+        values,
+        match_mode,
+        result_handle,
+        category_name,
+        batch_size,
+    )
+
+    normalized_operator = _normalize_filter_operator(operator)
+    filter_values = _normalize_filter_values(value=value, values=values)
+    normalized_match_mode = str(match_mode or "any").strip().lower()
+    if not parameter_name or not filter_values:
+        return {"status": "error", "message": "parameter_name and either value or values are required."}
+    if not normalized_operator:
+        return {
+            "status": "error",
+            "message": "Unsupported filter operator '{}'. Supported operators: {}.".format(
+                operator,
+                ", ".join(FILTER_OPERATORS),
+            ),
+        }
+    if normalized_match_mode not in FILTER_MULTI_MATCH_MODES:
+        return {
+            "status": "error",
+            "message": "Unsupported match_mode '{}'. Supported values: {}.".format(
+                match_mode,
+                ", ".join(FILTER_MULTI_MATCH_MODES),
+            ),
+        }
+    operator = normalized_operator
+
+    parameter_resolution = resolve_revit_targets_internal(services, {"parameter_names": [parameter_name]})
+    param_map = parameter_resolution.get("resolved", {}).get("parameter_names", {})
+    if parameter_name in param_map:
+        mapped = param_map[parameter_name]
+        confidence = float(mapped.get("confidence", 0.0))
+        if confidence >= services.config.min_confidence_for_parameter_remap:
+            parameter_name = mapped.get("resolved_name", parameter_name)
+
+    resolved_ids, record, resolve_error = services.result_store.resolve_element_ids(
+        element_ids=None,
+        result_handle=result_handle,
+        category_name=category_name,
+    )
+    if resolve_error:
+        return resolve_error
+
+    total_ids = len(resolved_ids)
+    if total_ids == 0:
+        return {"status": "success", "count": 0, "message": "No source elements available for server-side filtering."}
+
+    if batch_size is None:
+        inferred_batch_size = 1000 if total_ids >= 5000 else services.config.default_server_filter_batch_size
+    else:
+        inferred_batch_size = int(batch_size)
+
+    safe_batch_size = max(20, min(1000, int(inferred_batch_size)))
+    total_batches = int((total_ids + safe_batch_size - 1) / safe_batch_size)
+
+    matched_ids = []
+    matched_samples = []
+
+    for batch_index, start in enumerate(range(0, total_ids, safe_batch_size), 1):
+        batch_ids = resolved_ids[start : start + safe_batch_size]
+        batch_result = services.revit_client.call_listener(
+            command_path="/elements/get_properties",
+            method="POST",
+            payload_data={"element_ids": batch_ids, "parameter_names": [parameter_name]},
+        )
+
+        if batch_result.get("status") == "error":
+            if services.revit_client.is_route_not_defined(batch_result, "/elements/get_properties"):
+                return {
+                    "status": "error",
+                    "error_type": "route_not_defined",
+                    "message": "The active Revit route set does not support '/elements/get_properties'. Reload/update the Revit extension to enable server-side filtering.",
+                }
+            return batch_result
+
+        elements = batch_result.get("elements", []) or []
+        for element_data in elements:
+            element_id = str(element_data.get("element_id", "")).strip()
+            properties = element_data.get("properties", {}) or {}
+            typed_properties = element_data.get("typed_properties", {}) or {}
+            current_value = properties.get(parameter_name, "Not available")
+            typed_value = typed_properties.get(parameter_name, {})
+            match_results = []
+            for filter_value in filter_values:
+                matched, match_error = _matches_filter_value(
+                    current_value,
+                    filter_value,
+                    operator=operator,
+                    case_sensitive=case_sensitive,
+                    typed_value=typed_value,
+                )
+                if match_error:
+                    return {
+                        "status": "error",
+                        "message": match_error,
+                        "parameter_name": parameter_name,
+                        "operator": operator,
+                    }
+                match_results.append(bool(matched))
+
+            matched = any(match_results) if normalized_match_mode == "any" else all(match_results)
+            if matched:
+                matched_ids.append(element_id)
+                if len(matched_samples) < services.config.max_records_in_response:
+                    matched_samples.append({"element_id": element_id, parameter_name: current_value})
+
+        if batch_index == 1 or batch_index % 5 == 0 or batch_index == total_batches:
+            services.logger.info(
+                "Server-side filter progress: batch %s/%s, processed=%s/%s, matched=%s",
+                batch_index,
+                total_batches,
+                min(start + len(batch_ids), total_ids),
+                total_ids,
+                len(matched_ids),
+            )
+
+    source_key = record.get("storage_key") if isinstance(record, dict) else services.result_store.normalize_storage_key(category_name or "elements")
+    parameter_key = services.result_store.normalize_storage_key(parameter_name)
+    filtered_storage_seed = "{}_{}_filtered".format(source_key, parameter_key)
+    stored_key, new_result_handle = services.result_store.store_elements(filtered_storage_seed, matched_ids, len(matched_ids))
+
+    result = {
+        "status": "success",
+        "count": len(matched_ids),
+        "source_count": total_ids,
+        "processed_count": total_ids,
+        "parameter_name": parameter_name,
+        "operator": operator,
+        "value": str(filter_values[0]) if len(filter_values) == 1 else None,
+        "values": filter_values,
+        "match_mode": normalized_match_mode,
+        "case_sensitive": bool(case_sensitive),
+        "matched_sample": matched_samples,
+        "element_ids": matched_ids,
+        "stored_as": stored_key,
+        "result_handle": new_result_handle,
+        "storage_message": "Filtered results stored as '{}' ({}) - use select_stored_elements with result_handle".format(
+            stored_key,
+            new_result_handle,
+        ),
+        "message": "Server-side parameter filtering matched {} of {} source elements.".format(len(matched_ids), total_ids),
+    }
+    return services.result_store.compact_result_payload(
+        result,
+        preserve_keys=[
+            "stored_as",
+            "result_handle",
+            "storage_message",
+            "count",
+            "source_count",
+            "processed_count",
+            "status",
+            "message",
+            "parameter_name",
+            "operator",
+            "value",
+            "values",
+            "match_mode",
+        ],
+    )
+
+
+def get_element_properties_handler(
+    services,
+    element_ids: list[str] = None,
+    parameter_names: list[str] = None,
+    result_handle: str = None,
+    include_all_parameters: bool = False,
+    populated_only: bool = False,
+    offset: int = 0,
+    limit: int = None,
+    **_kwargs,
+) -> dict:
+    resolved_ids, _record, resolve_error = services.result_store.resolve_element_ids(
+        element_ids=element_ids,
+        result_handle=result_handle,
+    )
+    if resolve_error:
+        return resolve_error
+
+    requested_count = len(resolved_ids)
+    source_count = requested_count
+    pageable_count = len(resolved_ids)
+    page_offset = _bounded_int(offset, 0, min_value=0, max_value=pageable_count)
+    default_page_cap = max(1, int(services.config.max_records_in_response))
+    explicit_page_cap = max(1, int(services.config.max_elements_for_property_read))
+    max_page_size = explicit_page_cap if limit is not None else default_page_cap
+    default_page_size = min(default_page_cap, pageable_count) if pageable_count else default_page_cap
+    page_limit = _bounded_int(limit, default_page_size, min_value=1, max_value=max_page_size)
+    page_ids = resolved_ids[page_offset : page_offset + page_limit]
+    next_offset = page_offset + len(page_ids)
+    has_more = next_offset < pageable_count
+
+    services.logger.info(
+        "MCP Tool executed: %s with %s source elements, page offset=%s limit=%s",
+        GET_ELEMENT_PROPERTIES_TOOL_NAME,
+        pageable_count,
+        page_offset,
+        page_limit,
+    )
+
+    if not page_ids:
+        result = {
+            "status": "success",
+            "message": "Retrieved properties for 0 elements.",
+            "count": 0,
+            "elements": [],
+            "source_count": source_count,
+            "pageable_count": pageable_count,
+            "page_offset": page_offset,
+            "page_limit": page_limit,
+            "returned_count": 0,
+            "has_more": False,
+            "next_offset": None,
+        }
+        if result_handle:
+            result["result_handle"] = result_handle
+        return result
+
+    payload = {"element_ids": page_ids}
+    if parameter_names:
+        payload["parameter_names"] = parameter_names
+    if include_all_parameters:
+        payload["include_all_parameters"] = True
+    if populated_only:
+        payload["populated_only"] = True
+
+    result = services.revit_client.call_listener(
+        command_path="/elements/get_properties",
+        method="POST",
+        payload_data=payload,
+    )
+    if result.get("status") == "error" and services.revit_client.is_route_not_defined(result, "/elements/get_properties"):
+        return {
+            "status": "error",
+            "error_type": "route_not_defined",
+            "message": "The active Revit route set does not support '/elements/get_properties'. Reload/update the Revit extension to enable property reads.",
+        }
+    if result.get("status") == "success" and result_handle:
+        result["result_handle"] = result_handle
+    if result.get("status") == "success":
+        returned_count = len(result.get("elements", []) or [])
+        result["source_count"] = source_count
+        result["pageable_count"] = pageable_count
+        result["page_offset"] = page_offset
+        result["page_limit"] = page_limit
+        result["returned_count"] = returned_count
+        result["has_more"] = has_more
+        result["next_offset"] = next_offset if has_more else None
+        result["message"] = "Retrieved properties for {} of {} elements (offset {}, limit {}).".format(
+            returned_count,
+            pageable_count,
+            page_offset,
+            page_limit,
+        )
+        if has_more:
+            result["message"] += " Call again with offset={} for the next page.".format(next_offset)
+    preserve_keys = ["elements"] if limit is not None else None
+    return services.result_store.compact_result_payload(result, preserve_keys=preserve_keys)
+
+
+def get_element_relationships_handler(
+    services,
+    element_ids: list[str] = None,
+    result_handle: str = None,
+    include_host_chain: bool = True,
+    include_children: bool = True,
+    include_dependents: bool = False,
+    include_adaptive_points: bool = True,
+    max_depth: int = 3,
+    max_children: int = 100,
+    offset: int = 0,
+    limit: int = None,
+    **_kwargs,
+) -> dict:
+    resolved_ids, _record, resolve_error = services.result_store.resolve_element_ids(
+        element_ids=element_ids,
+        result_handle=result_handle,
+    )
+    if resolve_error:
+        return resolve_error
+
+    requested_count = len(resolved_ids)
+    page_offset = _bounded_int(offset, 0, min_value=0, max_value=requested_count)
+    default_page_cap = max(1, int(services.config.max_records_in_response))
+    explicit_page_cap = max(1, int(services.config.max_elements_for_property_read))
+    max_page_size = explicit_page_cap if limit is not None else default_page_cap
+    default_page_size = min(default_page_cap, requested_count) if requested_count else default_page_cap
+    page_limit = _bounded_int(limit, default_page_size, min_value=1, max_value=max_page_size)
+    page_ids = resolved_ids[page_offset : page_offset + page_limit]
+    next_offset = page_offset + len(page_ids)
+    has_more = next_offset < requested_count
+
+    safe_max_depth = _bounded_int(max_depth, 3, min_value=1, max_value=20)
+    safe_max_children = _bounded_int(max_children, 100, min_value=0, max_value=1000)
+    services.logger.info(
+        "MCP Tool executed: %s with %s source elements, page offset=%s limit=%s",
+        GET_ELEMENT_RELATIONSHIPS_TOOL_NAME,
+        requested_count,
+        page_offset,
+        page_limit,
+    )
+
+    if not page_ids:
+        return {
+            "status": "success",
+            "message": "Retrieved relationships for 0 elements.",
+            "count": 0,
+            "relationships": [],
+            "source_count": requested_count,
+            "page_offset": page_offset,
+            "page_limit": page_limit,
+            "returned_count": 0,
+            "has_more": False,
+            "next_offset": None,
+        }
+
+    result = services.revit_client.call_listener(
+        command_path="/elements/relationships",
+        method="POST",
+        payload_data={
+            "element_ids": page_ids,
+            "include_host_chain": bool(include_host_chain),
+            "include_children": bool(include_children),
+            "include_dependents": bool(include_dependents),
+            "include_adaptive_points": bool(include_adaptive_points),
+            "max_depth": safe_max_depth,
+            "max_children": safe_max_children,
+        },
+    )
+    if result.get("status") == "error" and services.revit_client.is_route_not_defined(result, "/elements/relationships"):
+        return {
+            "status": "error",
+            "error_type": "route_not_defined",
+            "message": "The active Revit route set does not support '/elements/relationships'. Reload/update the Revit extension to enable relationship reads.",
+        }
+    if result.get("status") == "success":
+        relationships = result.get("relationships", []) or []
+        result["source_count"] = requested_count
+        result["page_offset"] = page_offset
+        result["page_limit"] = page_limit
+        result["returned_count"] = len(relationships)
+        result["has_more"] = has_more
+        result["next_offset"] = next_offset if has_more else None
+        result["message"] = "Retrieved relationships for {} of {} elements (offset {}, limit {}).".format(
+            len(relationships),
+            requested_count,
+            page_offset,
+            page_limit,
+        )
+        if has_more:
+            result["message"] += " Call again with offset={} for the next page.".format(next_offset)
+    preserve_keys = ["relationships"] if limit is not None else None
+    return services.result_store.compact_result_payload(result, preserve_keys=preserve_keys)
+
+
+def get_element_locations_handler(
+    services,
+    element_ids: list[str] = None,
+    result_handle: str = None,
+    include_bounding_box: bool = True,
+    include_fallbacks: bool = True,
+    rounding_precision_mm: float = 1.0,
+    offset: int = 0,
+    limit: int = None,
+    **_kwargs,
+) -> dict:
+    resolved_ids, _record, resolve_error = services.result_store.resolve_element_ids(
+        element_ids=element_ids,
+        result_handle=result_handle,
+    )
+    if resolve_error:
+        return resolve_error
+
+    requested_count = len(resolved_ids)
+    page_offset = _bounded_int(offset, 0, min_value=0, max_value=requested_count)
+    default_page_cap = max(1, int(services.config.max_records_in_response))
+    explicit_page_cap = max(1, int(services.config.max_elements_for_property_read))
+    max_page_size = explicit_page_cap if limit is not None else default_page_cap
+    default_page_size = min(default_page_cap, requested_count) if requested_count else default_page_cap
+    page_limit = _bounded_int(limit, default_page_size, min_value=1, max_value=max_page_size)
+    page_ids = resolved_ids[page_offset : page_offset + page_limit]
+    next_offset = page_offset + len(page_ids)
+    has_more = next_offset < requested_count
+
+    try:
+        safe_rounding_precision_mm = float(rounding_precision_mm if rounding_precision_mm is not None else 1.0)
+    except Exception:
+        safe_rounding_precision_mm = 1.0
+    safe_rounding_precision_mm = max(0.0, min(10000.0, safe_rounding_precision_mm))
+
+    services.logger.info(
+        "MCP Tool executed: %s with %s source elements, page offset=%s limit=%s",
+        GET_ELEMENT_LOCATIONS_TOOL_NAME,
+        requested_count,
+        page_offset,
+        page_limit,
+    )
+
+    if not page_ids:
+        return {
+            "status": "success",
+            "message": "Retrieved locations for 0 elements.",
+            "count": 0,
+            "locations": [],
+            "source_count": requested_count,
+            "page_offset": page_offset,
+            "page_limit": page_limit,
+            "returned_count": 0,
+            "has_more": False,
+            "next_offset": None,
+        }
+
+    result = services.revit_client.call_listener(
+        command_path="/elements/locations",
+        method="POST",
+        payload_data={
+            "element_ids": page_ids,
+            "include_bounding_box": bool(include_bounding_box),
+            "include_fallbacks": bool(include_fallbacks),
+            "rounding_precision_mm": safe_rounding_precision_mm,
+        },
+    )
+    if result.get("status") == "error" and services.revit_client.is_route_not_defined(result, "/elements/locations"):
+        return {
+            "status": "error",
+            "error_type": "route_not_defined",
+            "message": "The active Revit route set does not support '/elements/locations'. Reload/update the Revit extension to enable location reads.",
+        }
+    if result.get("status") == "success":
+        locations = result.get("locations", []) or []
+        result["source_count"] = requested_count
+        result["page_offset"] = page_offset
+        result["page_limit"] = page_limit
+        result["returned_count"] = len(locations)
+        result["has_more"] = has_more
+        result["next_offset"] = next_offset if has_more else None
+        result["message"] = "Retrieved locations for {} of {} elements (offset {}, limit {}).".format(
+            len(locations),
+            requested_count,
+            page_offset,
+            page_limit,
+        )
+        if has_more:
+            result["message"] += " Call again with offset={} for the next page.".format(next_offset)
+    preserve_keys = ["locations"] if limit is not None else None
+    return services.result_store.compact_result_payload(result, preserve_keys=preserve_keys)
+
+
+def _normalize_parameter_names(value):
+    if not value:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    names = []
+    seen = set()
+    for item in value:
+        name = str(item or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
+
+
+def _relationship_ref_element_id(ref):
+    if not isinstance(ref, dict):
+        return None
+    element_id = ref.get("element_id") or ref.get("id")
+    if element_id is None:
+        return None
+    element_id = str(element_id).strip()
+    return element_id or None
+
+
+def _property_records_by_id(property_result):
+    records = {}
+    for item in property_result.get("elements", []) or []:
+        element_id = str(item.get("element_id", "")).strip()
+        if element_id:
+            records[element_id] = item
+    return records
+
+
+def _collect_related_ids(relationship, include_host=True, include_super_component=True, include_host_chain=True):
+    ids = []
+    seen = set()
+
+    def add_ref(ref):
+        element_id = _relationship_ref_element_id(ref)
+        if element_id and element_id not in seen:
+            seen.add(element_id)
+            ids.append(element_id)
+
+    if include_host:
+        add_ref(relationship.get("host"))
+    if include_super_component:
+        add_ref(relationship.get("super_component"))
+    if include_host_chain:
+        for chain_ref in relationship.get("host_chain", []) or []:
+            add_ref(chain_ref)
+
+    return ids
+
+
+def _enrich_relationship_ref(ref, property_records):
+    if not ref:
+        return None
+    element_id = _relationship_ref_element_id(ref)
+    property_record = property_records.get(element_id, {}) if element_id else {}
+    enriched = {
+        "element": ref,
+        "properties": property_record.get("properties", {}),
+        "typed_properties": property_record.get("typed_properties", {}),
+    }
+    if property_record.get("error"):
+        enriched["error"] = property_record.get("error")
+    return enriched
+
+
+def _read_element_properties_for_ids(services, element_ids, parameter_names):
+    if not element_ids:
+        return {"status": "success", "elements": []}
+    payload = {"element_ids": element_ids}
+    if parameter_names:
+        payload["parameter_names"] = parameter_names
+    result = services.revit_client.call_listener(
+        command_path="/elements/get_properties",
+        method="POST",
+        payload_data=payload,
+    )
+    if result.get("status") == "error" and services.revit_client.is_route_not_defined(result, "/elements/get_properties"):
+        return {
+            "status": "error",
+            "error_type": "route_not_defined",
+            "message": "The active Revit route set does not support '/elements/get_properties'. Reload/update the Revit extension to enable property reads.",
+        }
+    return result
+
+
+def get_related_element_properties_handler(
+    services,
+    element_ids: list[str] = None,
+    result_handle: str = None,
+    parameter_names: list[str] = None,
+    source_parameter_names: list[str] = None,
+    related_parameter_names: list[str] = None,
+    include_host: bool = True,
+    include_super_component: bool = True,
+    include_host_chain: bool = True,
+    max_depth: int = 3,
+    offset: int = 0,
+    limit: int = None,
+    **_kwargs,
+) -> dict:
+    resolved_ids, _record, resolve_error = services.result_store.resolve_element_ids(
+        element_ids=element_ids,
+        result_handle=result_handle,
+    )
+    if resolve_error:
+        return resolve_error
+
+    requested_count = len(resolved_ids)
+    page_offset = _bounded_int(offset, 0, min_value=0, max_value=requested_count)
+    default_page_cap = max(1, int(services.config.max_records_in_response))
+    explicit_page_cap = max(1, int(services.config.max_elements_for_property_read))
+    max_page_size = explicit_page_cap if limit is not None else default_page_cap
+    default_page_size = min(default_page_cap, requested_count) if requested_count else default_page_cap
+    page_limit = _bounded_int(limit, default_page_size, min_value=1, max_value=max_page_size)
+    page_ids = resolved_ids[page_offset : page_offset + page_limit]
+    next_offset = page_offset + len(page_ids)
+    has_more = next_offset < requested_count
+
+    source_names = _normalize_parameter_names(source_parameter_names) or _normalize_parameter_names(parameter_names)
+    related_names = _normalize_parameter_names(related_parameter_names) or _normalize_parameter_names(parameter_names)
+    safe_max_depth = _bounded_int(max_depth, 3, min_value=1, max_value=20)
+
+    services.logger.info(
+        "MCP Tool executed: %s with %s source elements, page offset=%s limit=%s",
+        GET_RELATED_ELEMENT_PROPERTIES_TOOL_NAME,
+        requested_count,
+        page_offset,
+        page_limit,
+    )
+
+    if not page_ids:
+        return {
+            "status": "success",
+            "message": "Retrieved related properties for 0 elements.",
+            "count": 0,
+            "items": [],
+            "source_count": requested_count,
+            "page_offset": page_offset,
+            "page_limit": page_limit,
+            "returned_count": 0,
+            "has_more": False,
+            "next_offset": None,
+        }
+
+    relationship_result = services.revit_client.call_listener(
+        command_path="/elements/relationships",
+        method="POST",
+        payload_data={
+            "element_ids": page_ids,
+            "include_host_chain": bool(include_host_chain),
+            "include_children": False,
+            "include_dependents": False,
+            "include_adaptive_points": False,
+            "max_depth": safe_max_depth,
+            "max_children": 0,
+        },
+    )
+    if relationship_result.get("status") == "error":
+        if services.revit_client.is_route_not_defined(relationship_result, "/elements/relationships"):
+            return {
+                "status": "error",
+                "error_type": "route_not_defined",
+                "message": "The active Revit route set does not support '/elements/relationships'. Reload/update the Revit extension to enable related property reads.",
+            }
+        return relationship_result
+
+    relationships = relationship_result.get("relationships", []) or []
+    related_ids = []
+    related_seen = set()
+    for relationship in relationships:
+        for related_id in _collect_related_ids(
+            relationship,
+            include_host=bool(include_host),
+            include_super_component=bool(include_super_component),
+            include_host_chain=bool(include_host_chain),
+        ):
+            if related_id not in related_seen:
+                related_seen.add(related_id)
+                related_ids.append(related_id)
+
+    source_property_result = _read_element_properties_for_ids(services, page_ids, source_names)
+    if source_property_result.get("status") == "error":
+        return source_property_result
+
+    related_property_result = _read_element_properties_for_ids(services, related_ids, related_names)
+    if related_property_result.get("status") == "error":
+        return related_property_result
+
+    source_property_records = _property_records_by_id(source_property_result)
+    related_property_records = _property_records_by_id(related_property_result)
+
+    items = []
+    for relationship in relationships:
+        source_id = str(relationship.get("element_id", "")).strip()
+        source_record = source_property_records.get(source_id, {})
+        item = {
+            "element_id": source_id,
+            "status": relationship.get("status", "success"),
+            "element": relationship.get("element"),
+            "source_properties": source_record.get("properties", {}),
+            "source_typed_properties": source_record.get("typed_properties", {}),
+            "host": _enrich_relationship_ref(relationship.get("host"), related_property_records),
+            "super_component": _enrich_relationship_ref(relationship.get("super_component"), related_property_records),
+            "host_chain": [
+                _enrich_relationship_ref(chain_ref, related_property_records)
+                for chain_ref in relationship.get("host_chain", []) or []
+                if chain_ref
+            ],
+        }
+        if source_record.get("error"):
+            item["source_error"] = source_record.get("error")
+        if relationship.get("error"):
+            item["relationship_error"] = relationship.get("error")
+        items.append(item)
+
+    result = {
+        "status": "success",
+        "message": "Retrieved related properties for {} of {} elements (offset {}, limit {}).".format(
+            len(items),
+            requested_count,
+            page_offset,
+            page_limit,
+        ),
+        "count": len(items),
+        "items": items,
+        "source_count": requested_count,
+        "page_offset": page_offset,
+        "page_limit": page_limit,
+        "returned_count": len(items),
+        "has_more": has_more,
+        "next_offset": next_offset if has_more else None,
+        "related_element_ids": related_ids,
+        "options": {
+            "include_host": bool(include_host),
+            "include_super_component": bool(include_super_component),
+            "include_host_chain": bool(include_host_chain),
+            "max_depth": safe_max_depth,
+            "source_parameter_names": source_names,
+            "related_parameter_names": related_names,
+        },
+    }
+    if has_more:
+        result["message"] += " Call again with offset={} for the next page.".format(next_offset)
+
+    preserve_keys = ["items"] if limit is not None else None
+    return services.result_store.compact_result_payload(result, preserve_keys=preserve_keys)
+
+
+def update_element_parameters_handler(
+    services,
+    updates: list[dict] = None,
+    element_ids: list[str] = None,
+    result_handle: str = None,
+    parameter_name: str = None,
+    new_value: str = None,
+    **_kwargs,
+) -> dict:
+    services.logger.info("MCP Tool executed: %s", UPDATE_ELEMENT_PARAMETERS_TOOL_NAME)
+    normalized_updates: list[dict] = []
+
+    if updates:
+        if not isinstance(updates, list) or not updates:
+            return {"status": "error", "message": "'updates' must be a non-empty list of update payloads."}
+
+        for update in updates:
+            if not isinstance(update, dict):
+                return {"status": "error", "message": "Each update must be an object with element_id and parameters."}
+            element_id = str(update.get("element_id", "")).strip()
+            parameters = update.get("parameters")
+            if not element_id or not parameters:
+                return {"status": "error", "message": "Each update requires element_id and parameters."}
+            if not isinstance(parameters, dict) or not parameters:
+                return {"status": "error", "message": "'parameters' must be a non-empty object of parameter/value pairs."}
+            normalized_updates.append({"element_id": element_id, "parameters": parameters})
+
+    elif (element_ids or result_handle) and parameter_name and new_value is not None:
+        resolved_ids, _record, resolve_error = services.result_store.resolve_element_ids(
+            element_ids=element_ids,
+            result_handle=result_handle,
+        )
+        if resolve_error:
+            return resolve_error
+        if not isinstance(resolved_ids, list) or not resolved_ids:
+            return {"status": "error", "message": "'element_ids' must be a non-empty list when using the simplified form."}
+        parameter_name = str(parameter_name).strip()
+        if not parameter_name:
+            return {"status": "error", "message": "parameter_name cannot be empty."}
+        normalized_value = str(new_value)
+        for element_id in resolved_ids:
+            normalized_element_id = str(element_id).strip()
+            if not normalized_element_id:
+                return {"status": "error", "message": "All element_ids must be non-empty strings."}
+            normalized_updates.append({"element_id": normalized_element_id, "parameters": {parameter_name: normalized_value}})
+    else:
+        return {"status": "error", "message": "Provide either 'updates' or (element_ids, parameter_name, new_value)."}
+
+    services.logger.info("Prepared %s parameter update(s) for execution.", len(normalized_updates))
+
+    if parameter_name:
+        parameter_resolution = resolve_revit_targets_internal(services, {"parameter_names": [parameter_name]})
+        param_map = parameter_resolution.get("resolved", {}).get("parameter_names", {})
+        if parameter_name in param_map:
+            mapped = param_map[parameter_name]
+            confidence = float(mapped.get("confidence", 0.0))
+            if confidence >= services.config.min_confidence_for_parameter_remap:
+                parameter_name = mapped.get("resolved_name", parameter_name)
+
+    result = services.revit_client.call_listener(
+        command_path="/elements/update_parameters",
+        method="POST",
+        payload_data={"updates": normalized_updates},
+    )
+    if result.get("status") == "error" and services.revit_client.is_route_not_defined(result, "/elements/update_parameters"):
+        return {
+            "status": "error",
+            "error_type": "route_not_defined",
+            "message": "The active Revit route set does not support '/elements/update_parameters'. Reload/update the Revit extension to enable parameter updates.",
+        }
+    if result.get("status") == "success" and result_handle:
+        result["result_handle"] = result_handle
+    return services.result_store.compact_result_payload(result)
+
+
+def sync_element_parameter_values_handler(
+    services,
+    source_parameters: list[str] = None,
+    target_parameter: str = None,
+    element_ids: list[str] = None,
+    result_handle: str = None,
+    target_policy: str = "missing_only",
+    source_strategy: str = "first_populated",
+    conflict_policy: str = "use_first",
+    dry_run: bool = True,
+    include_type_parameters: bool = True,
+    ignored_source_values: list[str] = None,
+    max_results: int = 50,
+    **_kwargs,
+) -> dict:
+    services.logger.info("MCP Tool executed: %s", SYNC_ELEMENT_PARAMETER_VALUES_TOOL_NAME)
+
+    normalized_source_parameters = _normalize_text_list(source_parameters)
+    normalized_target_parameter = _collapse_whitespace(target_parameter)
+    if not normalized_source_parameters:
+        return {"status": "error", "message": "'source_parameters' must be a non-empty list of parameter names."}
+    if not normalized_target_parameter:
+        return {"status": "error", "message": "'target_parameter' is required."}
+
+    normalized_target_policy = _normalize_sync_target_policy(target_policy)
+    if not normalized_target_policy:
+        return {
+            "status": "error",
+            "message": "Unsupported target_policy '{}'. Use 'missing_only' or 'overwrite_all'.".format(target_policy),
+        }
+
+    normalized_source_strategy = _normalize_sync_source_strategy(source_strategy)
+    if not normalized_source_strategy:
+        return {
+            "status": "error",
+            "message": "Unsupported source_strategy '{}'. Use 'first_populated'.".format(source_strategy),
+        }
+
+    normalized_conflict_policy = _normalize_sync_conflict_policy(conflict_policy)
+    if not normalized_conflict_policy:
+        return {
+            "status": "error",
+            "message": "Unsupported conflict_policy '{}'. Use 'use_first' or 'skip'.".format(conflict_policy),
+        }
+
+    resolved_ids, record, resolve_error = services.result_store.resolve_element_ids(
+        element_ids=element_ids,
+        result_handle=result_handle,
+    )
+    if resolve_error:
+        return resolve_error
+    if not isinstance(resolved_ids, list) or not resolved_ids:
+        return {"status": "error", "message": "No element IDs were resolved for parameter sync."}
+
+    resolution = resolve_revit_targets_internal(
+        services,
+        {"parameter_names": normalized_source_parameters + [normalized_target_parameter]},
+    )
+    if resolution.get("status") == "error":
+        return {
+            "status": "error",
+            "message": "Parameter resolution failed before sync.",
+            "resolution": resolution,
+        }
+
+    param_map = resolution.get("resolved", {}).get("parameter_names", {})
+    min_confidence = float(getattr(services.config, "min_confidence_for_parameter_remap", 0.82))
+
+    def resolve_parameter_name(name):
+        mapped = param_map.get(name)
+        if not mapped:
+            return name
+        try:
+            confidence = float(mapped.get("confidence", 0.0))
+        except Exception:
+            confidence = 0.0
+        if confidence >= min_confidence:
+            return mapped.get("resolved_name", name)
+        return name
+
+    resolved_source_parameters = _normalize_text_list(
+        [resolve_parameter_name(name) for name in normalized_source_parameters]
+    )
+    resolved_target_parameter = resolve_parameter_name(normalized_target_parameter)
+    safe_dry_run = True if dry_run is None else bool(dry_run)
+    safe_include_type_parameters = True if include_type_parameters is None else bool(include_type_parameters)
+
+    payload = {
+        "element_ids": [str(element_id).strip() for element_id in resolved_ids if str(element_id).strip()],
+        "source_parameters": resolved_source_parameters,
+        "target_parameter": resolved_target_parameter,
+        "target_policy": normalized_target_policy,
+        "source_strategy": normalized_source_strategy,
+        "conflict_policy": normalized_conflict_policy,
+        "dry_run": safe_dry_run,
+        "include_type_parameters": safe_include_type_parameters,
+        "ignored_source_values": _normalize_text_list(ignored_source_values),
+        "max_results": _bounded_int(max_results, 50, min_value=0, max_value=500),
+    }
+
+    result = services.revit_client.call_listener(
+        command_path="/elements/sync_parameters",
+        method="POST",
+        payload_data=payload,
+    )
+    if result.get("status") == "error" and services.revit_client.is_route_not_defined(result, "/elements/sync_parameters"):
+        return {
+            "status": "error",
+            "error_type": "route_not_defined",
+            "message": "The active Revit route set does not support '/elements/sync_parameters'. Reload/update the Revit extension to enable parameter sync.",
+        }
+
+    if result.get("status") == "success":
+        if result_handle:
+            result["result_handle"] = result_handle
+        if record:
+            result["source_record"] = {
+                "storage_key": record.get("storage_key"),
+                "category": record.get("category"),
+                "count": record.get("count"),
+            }
+        result["parameter_resolution"] = resolution
+
+    return services.result_store.compact_result_payload(result)
+
+
+def build_element_tools() -> list[ToolDefinition]:
+    return [
+        ToolDefinition(
+            name=GET_ACTIVE_SELECTION_TOOL_NAME,
+            description=(
+                "Returns a bounded snapshot of the current Revit selection. Successful results are stored for "
+                "follow-on selection or property reads."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of selected elements to return and store. Default 200.",
+                    }
+                },
+            },
+            handler=get_active_selection_handler,
+        ),
+        ToolDefinition(
+            name=GET_REVIT_DIAGNOSTICS_TOOL_NAME,
+            description=(
+                "Returns the live pyRevit route context: Revit process, active document, active view, current selection, "
+                "open documents, route version, and optionally whether Revit can start a transaction right now."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "check_write_context": {
+                        "type": "boolean",
+                        "description": "When true, attempts a no-op Revit transaction and rolls it back to verify write context.",
+                    },
+                    "selection_limit": {
+                        "type": "integer",
+                        "description": "Maximum selected elements to include in the diagnostic sample. Default 20.",
+                    },
+                },
+            },
+            handler=get_revit_diagnostics_handler,
+        ),
+        ToolDefinition(
+            name=GET_ELEMENTS_BY_CATEGORY_TOOL_NAME,
+            description=(
+                "Retrieves and stores all elements in the current Revit model for the specified category. Use this "
+                "ONLY when the user wants to find or get elements."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "category_name": {"type": "string", "description": "The name of the Revit category to retrieve."}
+                },
+                "required": ["category_name"],
+            },
+            handler=get_elements_by_category_handler,
+        ),
+        ToolDefinition(
+            name=SELECT_ELEMENTS_TOOL_NAME,
+            description=(
+                "DEPRECATED - Prefer select_stored_elements. Selects elements by exact IDs or by a stored result_handle. "
+                "By default it focuses the active view on the selected elements and returns selection/view diagnostics."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "element_ids": {"type": "array", "items": {"type": "string"}},
+                    "result_handle": {"type": "string"},
+                    "focus": {
+                        "type": "boolean",
+                        "description": "When true, calls Revit ShowElements after selecting. Default true.",
+                    },
+                    "refresh_view": {
+                        "type": "boolean",
+                        "description": "When true, refreshes the active view after selecting. Default true.",
+                    },
+                },
+            },
+            handler=select_elements_by_id_handler,
+        ),
+        ToolDefinition(
+            name=SELECT_STORED_ELEMENTS_TOOL_NAME,
+            description=(
+                "Selects elements previously retrieved by get_elements_by_category or filter_elements, then focuses "
+                "the active Revit view on the selected elements. Prefer result_handle to avoid passing large lists."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "category_name": {"type": "string"},
+                    "result_handle": {"type": "string"},
+                },
+            },
+            handler=select_stored_elements_handler,
+        ),
+        ToolDefinition(
+            name=LIST_STORED_ELEMENTS_TOOL_NAME,
+            description="Lists all currently stored element categories and their counts. Use this to see what elements are available for selection using select_stored_elements.",
+            json_schema={"type": "object", "properties": {}},
+            handler=list_stored_elements_handler,
+        ),
+        ToolDefinition(
+            name=FILTER_ELEMENTS_TOOL_NAME,
+            description=(
+                "Filters elements by category, level, and parameter conditions. Supports string operators plus "
+                "numeric range operators for numeric and length parameters. Bare length numbers are interpreted "
+                "using the parameter's displayed unit when available."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "category_name": {"type": "string"},
+                    "level_name": {"type": "string"},
+                    "parameters": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "value": {"type": "string"},
+                                "operator": {
+                                    "type": "string",
+                                    "enum": FILTER_OPERATORS,
+                                    "description": (
+                                        "Preferred comparison operator. For numeric and length parameters, use "
+                                        "greater_than, greater_than_or_equal, less_than, or less_than_or_equal."
+                                    ),
+                                },
+                                "condition": {
+                                    "type": "string",
+                                    "enum": FILTER_OPERATORS,
+                                    "description": "Legacy alias for operator. The same values are supported.",
+                                },
+                            },
+                            "required": ["name", "value"],
+                        },
+                    },
+                },
+                "required": ["category_name"],
+            },
+            handler=filter_elements_handler,
+        ),
+        ToolDefinition(
+            name=FILTER_STORED_ELEMENTS_BY_PARAMETER_TOOL_NAME,
+            description=(
+                "Filters a previously stored element set using server-side batched parameter reads. Supports the "
+                "same string and numeric operators as filter_elements, accepts one or many comparison values, and "
+                "is intended for narrowing stored results before selection."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "result_handle": {"type": "string"},
+                    "category_name": {"type": "string"},
+                    "parameter_name": {"type": "string"},
+                    "value": {
+                        "type": "string",
+                        "description": (
+                            "Single comparison value. Use values for bulk matching. For length parameters, explicit "
+                            "units like '1800 mm' are accepted; bare numbers use the parameter's displayed unit."
+                        ),
+                    },
+                    "values": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Multiple comparison values to evaluate in one server-side pass.",
+                    },
+                    "operator": {
+                        "type": "string",
+                        "enum": FILTER_OPERATORS,
+                        "description": (
+                            "Comparison operator. Numeric and length parameters support greater_than, "
+                            "greater_than_or_equal, less_than, and less_than_or_equal."
+                        ),
+                    },
+                    "match_mode": {
+                        "type": "string",
+                        "enum": FILTER_MULTI_MATCH_MODES,
+                        "description": "How to evaluate values when multiple comparison values are supplied.",
+                    },
+                    "batch_size": {"type": "integer"},
+                    "case_sensitive": {"type": "boolean"},
+                },
+                "required": ["parameter_name"],
+            },
+            handler=filter_stored_elements_by_parameter_handler,
+        ),
+        ToolDefinition(
+            name=GET_ELEMENT_PROPERTIES_TOOL_NAME,
+            description=(
+                "Gets parameter values for specified elements. Prefer result_handle over raw element_ids for large "
+                "result sets. Results are paged; use offset and limit to retrieve every page when has_more is true."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "element_ids": {"type": "array", "items": {"type": "string"}},
+                    "result_handle": {"type": "string"},
+                    "parameter_names": {"type": "array", "items": {"type": "string"}},
+                    "include_all_parameters": {"type": "boolean"},
+                    "populated_only": {"type": "boolean"},
+                    "offset": {
+                        "type": "integer",
+                        "description": "Zero-based page offset into the resolved element list. Use next_offset from the previous response.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": (
+                            "Maximum elements to return for this page. Defaults to the compact response page size. "
+                            "For exports, schedules, or table creation, set this to the desired row count; explicit "
+                            "limits are capped by the property-read safety limit."
+                        ),
+                    },
+                },
+            },
+            handler=get_element_properties_handler,
+        ),
+        ToolDefinition(
+            name=GET_ELEMENT_RELATIONSHIPS_TOOL_NAME,
+            description=(
+                "Gets host/parent/child relationships for Revit elements. Use this to walk from hosted windows "
+                "to adaptive curtain panel parents, inspect host chains, retrieve nested subcomponents, hosted "
+                "inserts, optional dependents, and adaptive placement points. Results are paged; use offset and "
+                "limit when has_more is true."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "element_ids": {"type": "array", "items": {"type": "string"}},
+                    "result_handle": {"type": "string"},
+                    "include_host_chain": {
+                        "type": "boolean",
+                        "description": "When true, walks Host/SuperComponent parent links up to max_depth. Default true.",
+                    },
+                    "include_children": {
+                        "type": "boolean",
+                        "description": "When true, includes subcomponents and hosted inserts where Revit exposes them. Default true.",
+                    },
+                    "include_dependents": {
+                        "type": "boolean",
+                        "description": "When true, includes dependent elements. Can be noisy. Default false.",
+                    },
+                    "include_adaptive_points": {
+                        "type": "boolean",
+                        "description": "When true, includes adaptive component placement points when available. Default true.",
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "description": "Maximum host-chain depth. Default 3, max 20.",
+                    },
+                    "max_children": {
+                        "type": "integer",
+                        "description": "Maximum subcomponents/inserts/dependents returned per source element. Default 100, max 1000.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Zero-based page offset into the resolved element list.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum source elements to process on this page.",
+                    },
+                },
+            },
+            handler=get_element_relationships_handler,
+        ),
+        ToolDefinition(
+            name=GET_ELEMENT_LOCATIONS_TOOL_NAME,
+            description=(
+                "Gets model-space XYZ locations for Revit elements. Uses LocationPoint, LocationCurve midpoint, "
+                "bounding-box center, and optional host/super-component fallback. Useful for overlap and duplicate "
+                "checks across scheduled element instances."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "element_ids": {"type": "array", "items": {"type": "string"}},
+                    "result_handle": {"type": "string"},
+                    "include_bounding_box": {
+                        "type": "boolean",
+                        "description": "When true, returns bounding boxes and can use bbox centers as fallback locations. Default true.",
+                    },
+                    "include_fallbacks": {
+                        "type": "boolean",
+                        "description": "When true, uses direct host or super-component location if the source element has none. Default true.",
+                    },
+                    "rounding_precision_mm": {
+                        "type": "number",
+                        "description": "Millimeter tolerance used to emit XY/XYZ overlap keys. Default 1.0; use 0 to disable rounding keys.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Zero-based page offset into the resolved element list.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum source elements to process on this page.",
+                    },
+                },
+            },
+            handler=get_element_locations_handler,
+        ),
+        ToolDefinition(
+            name=GET_RELATED_ELEMENT_PROPERTIES_TOOL_NAME,
+            description=(
+                "Resolves each source element's host/super-component/host-chain parents and reads selected "
+                "parameters from the source and related elements in one read-only call. Useful for QA checks like "
+                "hosted window parameters versus parent curtain panel geometry/settings."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "element_ids": {"type": "array", "items": {"type": "string"}},
+                    "result_handle": {"type": "string"},
+                    "parameter_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Parameter names to read from both source and related elements unless source/related-specific lists are supplied.",
+                    },
+                    "source_parameter_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Parameter names to read from the original source elements.",
+                    },
+                    "related_parameter_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Parameter names to read from host, super-component, and host-chain elements.",
+                    },
+                    "include_host": {
+                        "type": "boolean",
+                        "description": "When true, includes direct Host properties when Revit exposes a host. Default true.",
+                    },
+                    "include_super_component": {
+                        "type": "boolean",
+                        "description": "When true, includes immediate SuperComponent properties. Default true.",
+                    },
+                    "include_host_chain": {
+                        "type": "boolean",
+                        "description": "When true, includes parent-chain properties up to max_depth. Default true.",
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "description": "Maximum host-chain depth. Default 3, max 20.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Zero-based page offset into the resolved source element list.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum source elements to process on this page.",
+                    },
+                },
+            },
+            handler=get_related_element_properties_handler,
+        ),
+        ToolDefinition(
+            name=UPDATE_ELEMENT_PARAMETERS_TOOL_NAME,
+            description="Updates parameter values for elements. Prefer result_handle + parameter_name + new_value for bulk updates after filtering.",
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "updates": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "element_id": {"type": "string"},
+                                "parameters": {"type": "object"},
+                            },
+                            "required": ["element_id", "parameters"],
+                        },
+                    },
+                    "element_ids": {"type": "array", "items": {"type": "string"}},
+                    "result_handle": {"type": "string"},
+                    "parameter_name": {"type": "string"},
+                    "new_value": {"type": "string"},
+                },
+            },
+            handler=update_element_parameters_handler,
+        ),
+        ToolDefinition(
+            name=SYNC_ELEMENT_PARAMETER_VALUES_TOOL_NAME,
+            description=(
+                "Synchronizes element parameter data by copying the first populated source parameter value into a "
+                "target parameter across explicit element_ids or a stored result_handle. Defaults to dry_run and "
+                "missing_only so existing target values are not overwritten unless target_policy is overwrite_all."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "element_ids": {"type": "array", "items": {"type": "string"}},
+                    "result_handle": {"type": "string"},
+                    "source_parameters": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Ordered source parameter names. The first populated value is used.",
+                    },
+                    "target_parameter": {
+                        "type": "string",
+                        "description": "Parameter to write on each resolved element.",
+                    },
+                    "target_policy": {
+                        "type": "string",
+                        "enum": ["missing_only", "overwrite_all"],
+                        "description": "missing_only preserves existing target values. overwrite_all replaces every writable target value.",
+                    },
+                    "source_strategy": {
+                        "type": "string",
+                        "enum": ["first_populated"],
+                        "description": "How to choose source values. Currently only first_populated is supported.",
+                    },
+                    "conflict_policy": {
+                        "type": "string",
+                        "enum": ["use_first", "skip"],
+                        "description": "use_first writes the first populated source when multiple source parameters have values. skip leaves those elements unchanged.",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "When true, previews what would change without writing. Default true.",
+                    },
+                    "include_type_parameters": {
+                        "type": "boolean",
+                        "description": "When true, source parameters can fall back to the element type. Default true.",
+                    },
+                    "ignored_source_values": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Source display values to treat as blank, e.g. ['0', '0 mm'] for dimension cleanup.",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum per-element records to include in results_sample. Default 50, max 500.",
+                    },
+                },
+                "required": ["source_parameters", "target_parameter"],
+            },
+            handler=sync_element_parameter_values_handler,
+        ),
+    ]

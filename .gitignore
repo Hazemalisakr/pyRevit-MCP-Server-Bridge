@@ -1,0 +1,54 @@
+# Python specific
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+env/
+venv/
+ENV/
+
+# Logs
+logs/
+*.log
+listener_logs/
+
+# User-specific runtime data (if it appears at repo root)
+# These are generated in the user's Documents folder at runtime by the app
+user_data/
+
+# User-specific RevitMCP settings (old path within extension, good to keep ignoring)
+RevitMCP/user_data/revitmcp_settings.json
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Secrets and API Keys (common patterns)
+.env
+*.env
+secrets.json
+credentials.json
+API_KEYS.txt
+config.ini # If it contains secrets
+roadmap.md
+
+# IDE specific
+.idea/
+.vscode/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/ 
+
+# Local test scratch data
+lib/_tmp_testdata/
+
+# Local RevitMCP runtime artifacts
+.revitmcp_runtime/
+captures/
+
+# Local reference clones used during development
+references/

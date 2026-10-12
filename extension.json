@@ -1,0 +1,14 @@
+{
+  "builtin": "False",
+  "default_enabled": "True",
+  "type": "extension",
+  "rocket_mode_compatible": "False",
+  "name": "RevitMCP",
+  "description": "AI-enabled pyRevit extension plus companion MCP server bridge for interacting with a live Autodesk Revit session.",
+  "author": "Hazem Sakr",
+  "author_profile": "https://github.com/Hazemalisakr",
+  "url": "https://github.com/Hazemalisakr/pyRevit-MCP-Server-Bridge.git",
+  "website": "https://github.com/Hazemalisakr/pyRevit-MCP-Server-Bridge",
+  "image": "",
+  "dependencies": []
+}

@@ -1,0 +1,2878 @@
+# RevitMCP: Element-related HTTP routes
+# -*- coding: UTF-8 -*-
+#
+# Handlers declare `doc`, `uidoc`, or `uiapp` as parameter names so pyRevit's
+# Routes framework injects them on the UI thread (see
+# https://docs.pyrevitlabs.io/reference/pyrevit/routes/server/handler/). Do NOT
+# reach for `__revit__.ActiveUIDocument` from the worker thread — that's how
+# you end up with "modifications are temporarily disabled" and a null
+# ActiveView.
+
+import difflib
+import re
+import unicodedata
+
+import System
+from pyrevit import routes, script, DB
+from System.Collections.Generic import List
+
+from routes.json_safety import sanitize_for_json
+from routes.revit_compat import get_element_id_text, get_element_id_value, make_element_id
+
+
+ROUTE_DIAGNOSTIC_VERSION = "2026-05-02-strong-selection-diagnostics"
+MM_PER_FOOT = 304.8
+
+
+try:
+    STRING_TYPES = (basestring,)
+except NameError:
+    STRING_TYPES = (str,)
+
+
+def _coerce_text(value):
+    if value is None:
+        return ""
+
+    try:
+        text = str(value)
+    except Exception:
+        return ""
+
+    text = text.replace(u"\u00A0", " ").replace(u"\u2007", " ").replace(u"\u202F", " ")
+    return unicodedata.normalize("NFKC", text)
+
+
+def _collapse_whitespace(value):
+    return re.sub(r"\s+", " ", _coerce_text(value)).strip()
+
+
+def _normalize_category_key(value):
+    text = _collapse_whitespace(value).lower()
+    if text.startswith("ost_"):
+        text = text[4:]
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def _get_built_in_category_lookup():
+    lookup = {}
+    try:
+        category_names = list(System.Enum.GetNames(DB.BuiltInCategory))
+    except Exception:
+        category_names = [name for name in dir(DB.BuiltInCategory) if name.startswith("OST_")]
+
+    for category_name in category_names:
+        if not hasattr(DB.BuiltInCategory, category_name):
+            continue
+        built_in_category = getattr(DB.BuiltInCategory, category_name)
+        lookup.setdefault(_normalize_category_key(category_name), built_in_category)
+        lookup.setdefault(_normalize_category_key(category_name[4:]), built_in_category)
+
+    return lookup
+
+
+def _get_document_category_lookup(doc):
+    lookup = {}
+    if not doc:
+        return lookup
+
+    try:
+        for category in doc.Settings.Categories:
+            category_name = getattr(category, "Name", None)
+            normalized_key = _normalize_category_key(category_name)
+            if not normalized_key:
+                continue
+
+            built_in_category = None
+            try:
+                built_in_category = System.Enum.ToObject(DB.BuiltInCategory, get_element_id_value(category.Id))
+            except Exception:
+                built_in_category = None
+
+            lookup.setdefault(normalized_key, []).append(
+                {
+                    "name": category_name,
+                    "built_in_category": built_in_category,
+                }
+            )
+    except Exception:
+        return lookup
+
+    return lookup
+
+
+def _suggest_category_names(doc, category_name, limit=5):
+    normalized_query = _normalize_category_key(category_name)
+    if not normalized_query or not doc:
+        return []
+
+    suggestions = []
+    seen = set()
+
+    try:
+        for category in doc.Settings.Categories:
+            actual_name = getattr(category, "Name", None)
+            normalized_candidate = _normalize_category_key(actual_name)
+            if not actual_name or not normalized_candidate or actual_name in seen:
+                continue
+
+            seen.add(actual_name)
+            score = difflib.SequenceMatcher(None, normalized_query, normalized_candidate).ratio()
+            if normalized_query in normalized_candidate:
+                score += 0.15
+            suggestions.append((score, actual_name))
+    except Exception:
+        return []
+
+    suggestions.sort(key=lambda item: (-item[0], item[1]))
+    return [name for score, name in suggestions if score >= 0.35][:limit]
+
+
+def _resolve_built_in_category(category_name, route_logger, doc=None):
+    if not category_name:
+        return None
+
+    raw_name = _collapse_whitespace(category_name)
+    if hasattr(DB.BuiltInCategory, raw_name):
+        return getattr(DB.BuiltInCategory, raw_name)
+
+    normalized_key = _normalize_category_key(raw_name)
+    if not normalized_key:
+        return None
+
+    document_category_lookup = _get_document_category_lookup(doc)
+    document_matches = document_category_lookup.get(normalized_key, [])
+    for match in document_matches:
+        built_in_category = match.get("built_in_category")
+        if built_in_category is not None:
+            if match.get("name") != raw_name:
+                route_logger.info(
+                    "Interpreted category '%s' as document category '%s'.",
+                    category_name,
+                    match.get("name"),
+                )
+            return built_in_category
+
+    built_in_lookup = _get_built_in_category_lookup()
+    built_in_category = built_in_lookup.get(normalized_key)
+    if built_in_category is not None:
+        route_logger.info("Resolved category '%s' via normalized BuiltInCategory lookup.", category_name)
+        return built_in_category
+
+    if not raw_name.upper().startswith("OST_"):
+        possible_ost = "OST_" + re.sub(r"[^A-Za-z0-9]+", "", raw_name)
+        if hasattr(DB.BuiltInCategory, possible_ost):
+            route_logger.info("Interpreted category '%s' as '%s'.", category_name, possible_ost)
+            return getattr(DB.BuiltInCategory, possible_ost)
+
+    return None
+
+
+def _find_parameter_on_element(element, param_name):
+    if not element:
+        return None
+
+    # First try direct lookup by displayed parameter name.
+    p = element.LookupParameter(param_name)
+    if p:
+        return p
+
+    # Then try built-in enum name conversion.
+    try:
+        enum_name = param_name.replace(" ", "_").upper()
+        if hasattr(DB.BuiltInParameter, enum_name):
+            return element.get_Parameter(getattr(DB.BuiltInParameter, enum_name))
+    except Exception:
+        pass
+
+    # Fallback to manual scan with case-insensitive matching.
+    target_name = str(param_name or "").strip().lower()
+    for item in element.Parameters:
+        if item and item.Definition and item.Definition.Name:
+            if item.Definition.Name == param_name:
+                return item
+            if str(item.Definition.Name).strip().lower() == target_name:
+                return item
+
+    return None
+
+
+def _get_type_element(element, doc=None):
+    try:
+        symbol = getattr(element, "Symbol", None)
+        if symbol:
+            return symbol
+    except Exception:
+        pass
+
+    if not doc:
+        return None
+
+    try:
+        if hasattr(element, "GetTypeId"):
+            type_id = element.GetTypeId()
+            if type_id and type_id != DB.ElementId.InvalidElementId:
+                return doc.GetElement(type_id)
+    except Exception:
+        return None
+
+    return None
+
+
+def _find_parameter(element, param_name, doc=None, include_type=False):
+    param = _find_parameter_on_element(element, param_name)
+    if param or not include_type:
+        return param
+
+    return _find_parameter_on_element(_get_type_element(element, doc), param_name)
+
+
+def _get_parameter_display_value(param, doc):
+    if not param or not param.HasValue:
+        return "Not available"
+
+    try:
+        if param.StorageType == DB.StorageType.String:
+            return param.AsString() or ""
+
+        if param.StorageType == DB.StorageType.Double:
+            return param.AsValueString() or str(param.AsDouble())
+
+        if param.StorageType == DB.StorageType.Integer:
+            return str(param.AsInteger())
+
+        if param.StorageType == DB.StorageType.ElementId:
+            elem_id = param.AsElementId()
+            if elem_id != DB.ElementId.InvalidElementId:
+                ref_elem = doc.GetElement(elem_id)
+                if ref_elem:
+                    name = getattr(ref_elem, "Name", None)
+                    return name if name else _safe_element_id_text(elem_id)
+                return _safe_element_id_text(elem_id)
+            return "None"
+
+        return param.AsValueString() or ""
+    except Exception:
+        return "Not available"
+
+
+def _get_parameter_typed_value(param, doc):
+    typed_value = {
+        "display_value": _get_parameter_display_value(param, doc),
+        "storage_type": None,
+        "has_value": bool(param and getattr(param, "HasValue", False)),
+        "is_numeric": False,
+    }
+
+    if not param:
+        return typed_value
+
+    try:
+        typed_value["storage_type"] = str(param.StorageType)
+    except Exception:
+        typed_value["storage_type"] = None
+
+    if not getattr(param, "HasValue", False):
+        return typed_value
+
+    try:
+        if param.StorageType == DB.StorageType.Double:
+            typed_value["is_numeric"] = True
+            typed_value["numeric_value"] = float(param.AsDouble())
+        elif param.StorageType == DB.StorageType.Integer:
+            typed_value["is_numeric"] = True
+            typed_value["numeric_value"] = int(param.AsInteger())
+    except Exception:
+        typed_value["is_numeric"] = False
+        typed_value.pop("numeric_value", None)
+
+    return typed_value
+
+
+def _is_meaningful_value(value):
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return False
+    if text.lower() in ("not available", "none", "null"):
+        return False
+    return True
+
+
+def _convert_length_magnitude_to_internal_feet(magnitude, unit):
+    if unit in ("millimeters", "millimeter", "mm"):
+        return magnitude / 304.8
+    if unit in ("centimeters", "centimeter", "cm"):
+        return magnitude / 30.48
+    if unit in ("meters", "meter", "m"):
+        return magnitude / 0.3048
+    if unit in ("inches", "inch", "in"):
+        return magnitude / 12.0
+    if unit in ("feet", "foot", "ft"):
+        return magnitude
+    return magnitude
+
+
+def _infer_length_unit(value):
+    value_str = _collapse_whitespace(value).lower()
+    if not value_str:
+        return None
+    if "'" in value_str or '"' in value_str:
+        return "ft"
+
+    unit_match = re.search(
+        r"[-+]?\d[\d,]*(?:\.\d+)?\s*(millimeters|millimeter|mm|centimeters|centimeter|cm|meters|meter|m|feet|foot|ft|inches|inch|in)\b",
+        value_str,
+    )
+    if unit_match:
+        return unit_match.group(1)
+    return None
+
+
+def _parse_length_to_internal_feet(value, default_unit=None):
+    value_str = _collapse_whitespace(value)
+    if not value_str:
+        raise ValueError("Length value is empty.")
+
+    if "'" in value_str or '"' in value_str:
+        feet = 0.0
+        inches = 0.0
+
+        if "'" in value_str:
+            feet_part = value_str.split("'")[0].strip()
+            feet = float(feet_part) if feet_part else 0.0
+
+        if '"' in value_str:
+            inches_part = value_str
+            if "'" in value_str:
+                inches_part = value_str.split("'")[1]
+            inches_part = inches_part.replace('"', '').strip()
+            inches = float(inches_part) if inches_part else 0.0
+
+        return feet + (inches / 12.0)
+
+    normalized_value = value_str.lower().replace(",", "")
+    unit_match = re.match(
+        r"^([-+]?\d*\.?\d+)\s*(millimeters|millimeter|mm|centimeters|centimeter|cm|meters|meter|m|feet|foot|ft|inches|inch|in)?$",
+        normalized_value,
+    )
+    if not unit_match:
+        return float(value_str)
+
+    magnitude = float(unit_match.group(1))
+    unit = unit_match.group(2)
+    if not unit:
+        unit = default_unit
+
+    return _convert_length_magnitude_to_internal_feet(magnitude, unit)
+
+
+def _set_parameter_value(param, new_value):
+    if param.StorageType == DB.StorageType.String:
+        param.Set(str(new_value))
+        return True, None
+
+    if param.StorageType == DB.StorageType.Double:
+        try:
+            param.Set(_parse_length_to_internal_feet(new_value))
+            return True, None
+        except Exception:
+            return False, "Could not convert '{}' to number".format(new_value)
+
+    if param.StorageType == DB.StorageType.Integer:
+        try:
+            param.Set(int(float(new_value)))
+            return True, None
+        except Exception:
+            return False, "Could not convert '{}' to integer".format(new_value)
+
+    return False, "Unsupported parameter type: {}".format(param.StorageType)
+
+
+def _find_parameter_with_scope(element, param_name, doc=None, include_type=False):
+    param = _find_parameter_on_element(element, param_name)
+    if param:
+        return param, "instance"
+
+    if not include_type:
+        return None, None
+
+    param = _find_parameter_on_element(_get_type_element(element, doc), param_name)
+    if param:
+        return param, "type"
+
+    return None, None
+
+
+def _normalize_sync_target_policy(value):
+    text = _collapse_whitespace(value).lower()
+    if not text:
+        return "missing_only"
+    if text in ("missing_only", "missing", "only_missing", "only_blanks", "blanks_only", "blank_only"):
+        return "missing_only"
+    if text in ("overwrite_all", "all", "overwrite", "replace_all"):
+        return "overwrite_all"
+    return None
+
+
+def _normalize_sync_conflict_policy(value):
+    text = _collapse_whitespace(value).lower()
+    if not text:
+        return "use_first"
+    if text in ("use_first", "first", "first_populated", "write_first"):
+        return "use_first"
+    if text in ("skip", "skip_conflicts", "skip_ambiguous", "ambiguous_skip"):
+        return "skip"
+    return None
+
+
+def _normalize_sync_source_strategy(value):
+    text = _collapse_whitespace(value).lower()
+    if not text:
+        return "first_populated"
+    if text in ("first_populated", "coalesce", "first_available", "first_non_blank"):
+        return "first_populated"
+    return None
+
+
+def _normalize_parameter_name_list(values):
+    normalized = []
+    seen = set()
+
+    if not isinstance(values, list):
+        return normalized
+
+    for value in values:
+        text = _collapse_whitespace(value)
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(text)
+
+    return normalized
+
+
+def _normalize_ignored_source_values(values):
+    ignored_values = set()
+
+    if not isinstance(values, list):
+        return ignored_values
+
+    for value in values:
+        text = _collapse_whitespace(value).lower()
+        if text:
+            ignored_values.add(text)
+
+    return ignored_values
+
+
+def _is_ignored_source_value(value, ignored_values):
+    text = _collapse_whitespace(value).lower()
+    if not text or not ignored_values:
+        return False
+    if text in ignored_values:
+        return True
+
+    if "0" not in ignored_values and "0 mm" not in ignored_values:
+        return False
+
+    try:
+        return abs(_parse_length_to_internal_feet(text)) < 0.0000001
+    except Exception:
+        try:
+            return abs(float(text)) < 0.0000001
+        except Exception:
+            return False
+
+
+def _sync_result_record(element_id_text, status, reason=None):
+    record = {
+        "element_id": element_id_text,
+        "status": status,
+    }
+    if reason:
+        record["reason"] = reason
+    return record
+
+
+def _source_values_for_sync(element, doc, source_parameters, include_type_parameters, ignored_source_values=None):
+    populated = []
+    missing = []
+    ignored_source_values = ignored_source_values or set()
+
+    for source_name in source_parameters:
+        param, scope = _find_parameter_with_scope(
+            element,
+            source_name,
+            doc=doc,
+            include_type=include_type_parameters,
+        )
+        if not param:
+            missing.append(source_name)
+            continue
+
+        display_value = _get_parameter_display_value(param, doc)
+        if not _is_meaningful_value(display_value):
+            missing.append(source_name)
+            continue
+        if _is_ignored_source_value(display_value, ignored_source_values):
+            missing.append(source_name)
+            continue
+
+        populated.append({
+            "parameter": source_name,
+            "value": display_value,
+            "scope": scope,
+        })
+
+    return populated, missing
+
+
+def _coerce_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    try:
+        text = str(value).strip().lower()
+    except Exception:
+        return default
+    if text in ("1", "true", "yes", "y", "on"):
+        return True
+    if text in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+
+def _bounded_int(value, default, min_value=None, max_value=None):
+    try:
+        number = int(value)
+    except Exception:
+        number = default
+    if min_value is not None:
+        number = max(min_value, number)
+    if max_value is not None:
+        number = min(max_value, number)
+    return number
+
+
+def _get_revit_process_info():
+    info = {"pid": None, "process_name": None}
+    try:
+        process = System.Diagnostics.Process.GetCurrentProcess()
+        info["pid"] = process.Id
+        info["process_name"] = process.ProcessName
+    except Exception:
+        pass
+    return info
+
+
+def _get_active_view_context(uidoc=None, doc=None):
+    view = None
+    try:
+        view = uidoc.ActiveView if uidoc else None
+    except Exception:
+        view = None
+    if not view and doc:
+        try:
+            view = doc.ActiveView
+        except Exception:
+            view = None
+
+    if not view:
+        return {"has_active_view": False, "id": None, "name": None, "type": None}
+
+    context = {"has_active_view": True, "id": None, "name": None, "type": None}
+    try:
+        context["id"] = _safe_element_id_text(view.Id)
+    except Exception:
+        pass
+    try:
+        context["name"] = view.Name
+    except Exception:
+        pass
+    try:
+        context["type"] = str(view.ViewType)
+    except Exception:
+        pass
+    return context
+
+
+def _get_document_write_state(doc, uidoc=None):
+    state = {
+        "has_document": bool(doc),
+        "title": None,
+        "path": None,
+        "is_read_only": None,
+        "is_modifiable": None,
+        "is_workshared": None,
+        "active_view": None,
+    }
+
+    if doc:
+        for key, attr_name in (
+            ("title", "Title"),
+            ("path", "PathName"),
+            ("is_read_only", "IsReadOnly"),
+            ("is_modifiable", "IsModifiable"),
+            ("is_workshared", "IsWorkshared"),
+        ):
+            try:
+                state[key] = getattr(doc, attr_name)
+            except Exception:
+                pass
+
+    try:
+        active_view = _get_active_view_context(uidoc, doc)
+        if active_view.get("has_active_view"):
+            state["active_view"] = active_view.get("name")
+            state["active_view_type"] = active_view.get("type")
+    except Exception:
+        pass
+
+    return state
+
+
+def _get_open_document_summaries(uiapp):
+    documents = []
+    try:
+        app = uiapp.Application if uiapp else None
+        for open_doc in app.Documents:
+            item = {"title": None, "path": None, "is_read_only": None, "is_modifiable": None}
+            for key, attr_name in (
+                ("title", "Title"),
+                ("path", "PathName"),
+                ("is_read_only", "IsReadOnly"),
+                ("is_modifiable", "IsModifiable"),
+            ):
+                try:
+                    item[key] = getattr(open_doc, attr_name)
+                except Exception:
+                    pass
+            documents.append(item)
+    except Exception:
+        pass
+    return documents
+
+
+def _get_element_level_name(element, doc):
+    built_in_names = (
+        "FAMILY_LEVEL_PARAM",
+        "INSTANCE_REFERENCE_LEVEL_PARAM",
+        "SCHEDULE_LEVEL_PARAM",
+        "WALL_BASE_CONSTRAINT",
+        "LEVEL_PARAM",
+    )
+    for built_in_name in built_in_names:
+        try:
+            if not hasattr(DB.BuiltInParameter, built_in_name):
+                continue
+            param = element.get_Parameter(getattr(DB.BuiltInParameter, built_in_name))
+            if not param or not getattr(param, "HasValue", False):
+                continue
+            level_id = param.AsElementId()
+            if level_id and level_id != DB.ElementId.InvalidElementId:
+                level = doc.GetElement(level_id)
+                if level and getattr(level, "Name", None):
+                    return level.Name
+        except Exception:
+            continue
+
+    try:
+        level_id = getattr(element, "LevelId", None)
+        if level_id and level_id != DB.ElementId.InvalidElementId:
+            level = doc.GetElement(level_id)
+            if level and getattr(level, "Name", None):
+                return level.Name
+    except Exception:
+        pass
+
+    return None
+
+
+def _get_selection_snapshot(uidoc, doc, limit=20):
+    snapshot = {
+        "selected_count": 0,
+        "sample_limit": limit,
+        "element_ids": [],
+        "elements": [],
+    }
+
+    try:
+        selected_ids = uidoc.Selection.GetElementIds()
+        snapshot["selected_count"] = selected_ids.Count
+        for elem_id in selected_ids:
+            if len(snapshot["element_ids"]) >= limit:
+                break
+            snapshot["element_ids"].append(_safe_element_id_text(elem_id))
+            element = doc.GetElement(elem_id) if doc else None
+            if element:
+                snapshot["elements"].append(_build_element_summary(element, doc))
+    except Exception as error:
+        snapshot["error"] = str(error)
+
+    return snapshot
+
+
+def _build_revit_diagnostics(uiapp, uidoc, doc, selection_limit=20):
+    return {
+        "status": "success",
+        "message": "Revit diagnostic context retrieved.",
+        "route_version": ROUTE_DIAGNOSTIC_VERSION,
+        "process": _get_revit_process_info(),
+        "document_state": _get_document_write_state(doc, uidoc),
+        "active_view": _get_active_view_context(uidoc, doc),
+        "selection": _get_selection_snapshot(uidoc, doc, limit=selection_limit) if uidoc else None,
+        "open_documents": _get_open_document_summaries(uiapp),
+    }
+
+
+def handle_revit_diagnostics(uiapp, uidoc, doc, request):
+    route_logger = script.get_logger()
+
+    try:
+        payload = request.data if hasattr(request, 'data') else {}
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            return routes.Response(status=400, data={"error": "Invalid JSON payload"})
+
+        eval_code = payload.get('eval_code')
+        if eval_code:
+            output_lines = []
+            def custom_print(*args):
+                output_lines.append(u" ".join(unicode(a) for a in args))
+
+            local_scope = {
+                'doc': doc,
+                'uidoc': uidoc,
+                'uiapp': uiapp,
+                'DB': DB,
+                'print': custom_print,
+            }
+            try:
+                # If code contains transaction itself or needs one
+                exec(eval_code, local_scope)
+                return sanitize_for_json({
+                    "status": "success",
+                    "output": u"\n".join(output_lines),
+                    "code_executed": True
+                })
+            except Exception as eval_err:
+                route_logger.error("Error executing eval_code: {}".format(eval_err), exc_info=True)
+                return routes.Response(
+                    status=500,
+                    data=sanitize_for_json({
+                        "status": "error",
+                        "error": str(eval_err),
+                        "output": u"\n".join(output_lines)
+                    })
+                )
+
+        try:
+            selection_limit = int(payload.get('selection_limit', 20))
+        except Exception:
+            selection_limit = 20
+        selection_limit = max(0, min(200, selection_limit))
+
+        diagnostics = _build_revit_diagnostics(uiapp, uidoc, doc, selection_limit=selection_limit)
+        check_write_context = _coerce_bool(payload.get('check_write_context'), default=False)
+        diagnostics["write_context_check"] = {
+            "attempted": check_write_context,
+            "can_start_transaction": None,
+            "rollback_ok": None,
+            "error": None,
+        }
+
+        if check_write_context:
+            transaction = None
+            try:
+                transaction = DB.Transaction(doc, "RevitMCP Diagnostics Write Context")
+                transaction.Start()
+                diagnostics["write_context_check"]["can_start_transaction"] = True
+                try:
+                    transaction.RollBack()
+                    diagnostics["write_context_check"]["rollback_ok"] = True
+                except Exception as rollback_error:
+                    diagnostics["write_context_check"]["rollback_ok"] = False
+                    diagnostics["write_context_check"]["rollback_error"] = str(rollback_error)
+            except Exception as transaction_error:
+                diagnostics["write_context_check"]["can_start_transaction"] = False
+                diagnostics["write_context_check"]["error"] = str(transaction_error)
+                diagnostics["document_state"] = _get_document_write_state(doc, uidoc)
+
+        return sanitize_for_json(diagnostics)
+
+    except Exception as e:
+        route_logger.error("Error in /diagnostics/revit_state: {}".format(e), exc_info=True)
+        return routes.Response(
+            status=500,
+            data=sanitize_for_json({
+                "status": "error",
+                "error": "Internal server error retrieving Revit diagnostics.",
+                "details": str(e),
+                "route_version": ROUTE_DIAGNOSTIC_VERSION,
+                "document_state": _get_document_write_state(doc, uidoc),
+            }),
+        )
+
+
+def _normalize_element_id_values(raw_ids):
+    """Parse incoming element IDs without touching Revit API objects."""
+    valid_id_values = []
+    requested_count = 0
+    invalid_ids = []
+
+    if raw_ids is None:
+        return valid_id_values, requested_count, invalid_ids
+
+    if isinstance(raw_ids, STRING_TYPES):
+        raw_ids = [raw_ids]
+
+    for raw_id in raw_ids:
+        requested_count += 1
+        try:
+            element_id_int = int(str(raw_id).strip())
+            if element_id_int > 0:
+                valid_id_values.append(element_id_int)
+            else:
+                invalid_ids.append(str(raw_id))
+        except Exception:
+            invalid_ids.append(str(raw_id))
+
+    return valid_id_values, requested_count, invalid_ids
+
+
+def _select_element_id_values(uidoc, doc, element_id_values, requested_count, invalid_ids, refresh_view=True, focus=True):
+    valid_existing_ids = List[DB.ElementId]()
+    selected_ids_processed = []
+    missing_ids = []
+    selected_samples = []
+    levels_detected = []
+    level_names_seen = set()
+    elements_with_location = 0
+
+    for element_id_value in element_id_values:
+        elem_id = make_element_id(DB, element_id_value)
+        element = doc.GetElement(elem_id)
+        if element:
+            valid_existing_ids.Add(elem_id)
+            selected_ids_processed.append(str(element_id_value))
+            if len(selected_samples) < 10:
+                selected_samples.append(_build_element_summary(element, doc))
+            try:
+                if getattr(element, "Location", None):
+                    elements_with_location += 1
+            except Exception:
+                pass
+            level_name = _get_element_level_name(element, doc)
+            if level_name and level_name not in level_names_seen:
+                level_names_seen.add(level_name)
+                levels_detected.append(level_name)
+        else:
+            missing_ids.append(str(element_id_value))
+
+    all_invalid_ids = list(invalid_ids or []) + missing_ids
+    selection_set = {
+        "attempted": True,
+        "applied": False,
+        "error": None,
+    }
+    try:
+        uidoc.Selection.SetElementIds(List[DB.ElementId]())
+        uidoc.Selection.SetElementIds(valid_existing_ids)
+        selection_set["applied"] = True
+    except Exception as selection_error:
+        selection_set["error"] = str(selection_error)
+        return routes.Response(
+            status=500,
+            data=sanitize_for_json({
+                "status": "error",
+                "error": "Failed to set Revit UI selection.",
+                "details": str(selection_error),
+                "route_version": ROUTE_DIAGNOSTIC_VERSION,
+                "requested_count": requested_count,
+                "valid_elements": valid_existing_ids.Count,
+                "invalid_input_ids": list(invalid_ids or []),
+                "missing_ids": missing_ids,
+                "invalid_ids": all_invalid_ids,
+                "selected_ids_processed": selected_ids_processed,
+                "selection_set": selection_set,
+                "view_context": _get_active_view_context(uidoc, doc),
+                "document_state": _get_document_write_state(doc, uidoc),
+                "selection_diagnostics": {
+                    "elements_with_location_sample_count": elements_with_location,
+                    "levels_detected": levels_detected,
+                    "sample_elements": selected_samples,
+                },
+                "threading_note": (
+                    "Selection failed while calling uidoc.Selection.SetElementIds. "
+                    "If details mention HandleEvent/UI thread, this route must be registered as a request-only "
+                    "startup handler and use __revit__.ActiveUIDocument, matching the previously working route."
+                ),
+            }),
+        )
+
+    show_elements = {
+        "attempted": False,
+        "applied": False,
+        "error": None,
+    }
+    if focus and valid_existing_ids.Count > 0:
+        show_elements["attempted"] = True
+        try:
+            selected_ids = uidoc.Selection.GetElementIds()
+            uidoc.ShowElements(selected_ids)
+            show_elements["applied"] = True
+        except Exception as show_error:
+            show_elements["error"] = str(show_error)
+
+    refresh_result = {"attempted": bool(refresh_view), "applied": False, "error": None}
+    if refresh_view:
+        try:
+            uidoc.RefreshActiveView()
+            refresh_result["applied"] = True
+        except Exception as refresh_error:
+            refresh_result["error"] = str(refresh_error)
+
+    actual_selection_count = 0
+    try:
+        actual_selection_count = uidoc.Selection.GetElementIds().Count
+    except Exception:
+        actual_selection_count = valid_existing_ids.Count
+
+    result = {
+        "status": "success",
+        "message": "Selected {} elements in Revit.".format(actual_selection_count),
+        "route_version": ROUTE_DIAGNOSTIC_VERSION,
+        "requested_count": requested_count,
+        "selected_count": actual_selection_count,
+        "valid_elements": valid_existing_ids.Count,
+        "invalid_input_ids": list(invalid_ids or []),
+        "missing_ids": missing_ids,
+        "invalid_ids": all_invalid_ids,
+        "selected_ids_processed": selected_ids_processed,
+        "focus_requested": bool(focus),
+        "selection_set": selection_set,
+        "show_elements": show_elements,
+        "refresh_view": refresh_result,
+        "view_context": _get_active_view_context(uidoc, doc),
+        "document_state": _get_document_write_state(doc, uidoc),
+        "selection_diagnostics": {
+            "actual_selection_count": actual_selection_count,
+            "elements_with_location_sample_count": elements_with_location,
+            "levels_detected": levels_detected,
+            "sample_elements": selected_samples,
+        },
+        "visibility_note": (
+            "ShowElements was requested for the selected IDs. If selected elements are still not visible, check active "
+            "view discipline, phase, design option, workset, crop, filters, or switch to a 3D view."
+        ),
+    }
+    return sanitize_for_json(result)
+
+
+def _perform_select_elements(uidoc, doc, request, route_logger):
+    """Body of the selection routes. Runs on Revit's UI thread because the
+    calling handler declares `uidoc`/`doc`, which makes pyRevit's Routes
+    framework dispatch via `IExternalEventHandler.Execute(uiapp)`."""
+    try:
+        payload = request.data if hasattr(request, 'data') else None
+        if not payload or not isinstance(payload, dict):
+            return routes.Response(status=400, data={"error": "Invalid JSON payload"})
+
+        raw_ids = payload.get('element_ids')
+        if not raw_ids:
+            return routes.Response(status=400, data={"error": "Missing 'element_ids'"})
+
+        focus = _coerce_bool(payload.get('focus'), default=True)
+        refresh_view = _coerce_bool(payload.get('refresh_view'), default=True)
+        element_id_values, requested_count, invalid_ids = _normalize_element_id_values(raw_ids)
+
+        route_logger.info(
+            "Selecting {} requested IDs (focus={}, refresh_view={})".format(
+                requested_count,
+                focus,
+                refresh_view,
+            )
+        )
+
+        return _select_element_id_values(
+            uidoc,
+            doc,
+            element_id_values,
+            requested_count,
+            invalid_ids,
+            refresh_view=refresh_view,
+            focus=focus,
+        )
+
+    except Exception as e:
+        route_logger.error("Error in selection handler: {}".format(e), exc_info=True)
+        return routes.Response(
+            status=500,
+            data=sanitize_for_json({
+                "status": "error",
+                "error": "Internal server error in selection handler",
+                "details": str(e),
+                "route_version": ROUTE_DIAGNOSTIC_VERSION,
+            }),
+        )
+
+
+def _normalize_filter_operator(operator):
+    alias_map = {
+        None: "equals",
+        "": "equals",
+        "equals": "equals",
+        "==": "equals",
+        "contains": "contains",
+        "not_equals": "not_equals",
+        "not equal": "not_equals",
+        "!=": "not_equals",
+        "starts_with": "starts_with",
+        "ends_with": "ends_with",
+        "greater_than": "greater_than",
+        ">": "greater_than",
+        "greater_than_or_equal": "greater_than_or_equal",
+        ">=": "greater_than_or_equal",
+        "less_than": "less_than",
+        "<": "less_than",
+        "less_than_or_equal": "less_than_or_equal",
+        "<=": "less_than_or_equal",
+    }
+    return alias_map.get(str(operator or "").strip().lower())
+
+
+def _is_numeric_operator(operator):
+    return operator in ("greater_than", "greater_than_or_equal", "less_than", "less_than_or_equal")
+
+
+def _compare_numeric_values(candidate_value, expected_value, operator):
+    if operator == "greater_than":
+        return candidate_value > expected_value
+    if operator == "greater_than_or_equal":
+        return candidate_value >= expected_value
+    if operator == "less_than":
+        return candidate_value < expected_value
+    if operator == "less_than_or_equal":
+        return candidate_value <= expected_value
+    return False
+
+
+def _evaluate_parameter_filter(param, expected_value, operator, doc):
+    normalized_operator = _normalize_filter_operator(operator)
+    if not normalized_operator:
+        return False, "Unsupported filter operator '{}'.".format(operator)
+
+    if not param:
+        return False, None
+
+    param_name = "Unknown Parameter"
+    try:
+        if param.Definition and param.Definition.Name:
+            param_name = param.Definition.Name
+    except Exception:
+        pass
+
+    if _is_numeric_operator(normalized_operator):
+        if not getattr(param, "HasValue", False):
+            return False, None
+
+        if param.StorageType == DB.StorageType.Double:
+            try:
+                candidate_value = float(param.AsDouble())
+                expected_numeric = _parse_length_to_internal_feet(
+                    expected_value,
+                    default_unit=_infer_length_unit(_get_parameter_display_value(param, doc)),
+                )
+            except Exception:
+                return (
+                    False,
+                    "Could not parse numeric filter value '{}'. Use a plain number or an explicit length such as 2000 mm, 2 m, or 6' 6\".".format(
+                        expected_value
+                    ),
+                )
+            return _compare_numeric_values(candidate_value, expected_numeric, normalized_operator), None
+
+        if param.StorageType == DB.StorageType.Integer:
+            try:
+                candidate_value = int(param.AsInteger())
+                expected_numeric = float(_collapse_whitespace(expected_value))
+            except Exception:
+                return (
+                    False,
+                    "Could not parse numeric filter value '{}'. Integer filters require a numeric value.".format(
+                        expected_value
+                    ),
+                )
+            return _compare_numeric_values(float(candidate_value), float(expected_numeric), normalized_operator), None
+
+        return (
+            False,
+            "Parameter '{}' is not numeric/filterable with operator '{}'.".format(param_name, normalized_operator),
+        )
+
+    current_value = _get_parameter_display_value(param, doc)
+    current_text = str(current_value or "")
+    expected_text = str(expected_value)
+
+    current_cmp = current_text.lower()
+    expected_cmp = expected_text.lower()
+
+    if normalized_operator == "equals":
+        return current_cmp == expected_cmp, None
+    if normalized_operator == "contains":
+        return expected_cmp in current_cmp, None
+    if normalized_operator == "not_equals":
+        return current_cmp != expected_cmp, None
+    if normalized_operator == "starts_with":
+        return current_cmp.startswith(expected_cmp), None
+    if normalized_operator == "ends_with":
+        return current_cmp.endswith(expected_cmp), None
+
+    return False, "Unsupported filter operator '{}'.".format(operator)
+
+
+def _append_parameter_property(properties, typed_properties, param_name, param, doc, populated_only=False):
+    display_value = _get_parameter_display_value(param, doc) if param else "Not available"
+    if populated_only and not _is_meaningful_value(display_value):
+        return
+
+    properties[param_name] = display_value
+    typed_properties[param_name] = _get_parameter_typed_value(param, doc)
+
+
+def _get_element_identity(element, doc):
+    family_name = "Not available"
+    type_name = "Not available"
+
+    try:
+        symbol = getattr(element, "Symbol", None)
+    except Exception:
+        symbol = None
+
+    try:
+        if not symbol and doc and hasattr(element, "GetTypeId"):
+            type_id = element.GetTypeId()
+            if type_id and type_id != DB.ElementId.InvalidElementId:
+                symbol = doc.GetElement(type_id)
+    except Exception:
+        symbol = symbol if symbol else None
+
+    try:
+        if symbol:
+            if hasattr(symbol, "Name") and symbol.Name:
+                type_name = symbol.Name
+            family = getattr(symbol, "Family", None)
+            if family and hasattr(family, "Name") and family.Name:
+                family_name = family.Name
+    except Exception:
+        pass
+
+    display_name = None
+    try:
+        display_name = getattr(element, "Name", None)
+    except Exception:
+        display_name = None
+
+    if not display_name:
+        if type_name != "Not available":
+            display_name = type_name
+        else:
+            display_name = _safe_element_id_text(element.Id)
+
+    return display_name, family_name, type_name
+
+
+def _build_element_summary(element, doc):
+    category_name = "No Category"
+    try:
+        if element.Category and element.Category.Name:
+            category_name = element.Category.Name
+    except Exception:
+        pass
+
+    display_name, family_name, type_name = _get_element_identity(element, doc)
+
+    summary = {
+        "element_id": _safe_element_id_text(element.Id),
+        "name": display_name,
+        "category": category_name
+    }
+
+    if family_name != "Not available":
+        summary["family_name"] = family_name
+    if type_name != "Not available":
+        summary["type_name"] = type_name
+    if family_name != "Not available" and type_name != "Not available":
+        summary["family_and_type"] = "{} : {}".format(family_name, type_name)
+
+    try:
+        summary["class_name"] = element.GetType().Name
+    except Exception:
+        pass
+
+    return summary
+
+
+def _safe_element_id_text(element_id):
+    text = get_element_id_text(element_id)
+    if text is None:
+        return None
+    try:
+        if element_id == DB.ElementId.InvalidElementId:
+            return None
+    except Exception:
+        pass
+    return text
+
+
+def _safe_xyz_summary(xyz):
+    if not xyz:
+        return None
+    try:
+        return {
+            "x": float(xyz.X),
+            "y": float(xyz.Y),
+            "z": float(xyz.Z),
+        }
+    except Exception:
+        return None
+
+
+def _xyz_payload(xyz):
+    point = _safe_xyz_summary(xyz)
+    if not point:
+        return None
+
+    return {
+        "x": point["x"],
+        "y": point["y"],
+        "z": point["z"],
+        "unit": "ft",
+        "x_mm": point["x"] * MM_PER_FOOT,
+        "y_mm": point["y"] * MM_PER_FOOT,
+        "z_mm": point["z"] * MM_PER_FOOT,
+    }
+
+
+def _rounded_mm_payload(point_payload, precision_mm):
+    if not point_payload or not precision_mm or precision_mm <= 0:
+        return None
+
+    def _round_to_precision(value):
+        return round(float(value) / precision_mm) * precision_mm
+
+    try:
+        return {
+            "x_mm": _round_to_precision(point_payload["x_mm"]),
+            "y_mm": _round_to_precision(point_payload["y_mm"]),
+            "z_mm": _round_to_precision(point_payload["z_mm"]),
+            "precision_mm": precision_mm,
+        }
+    except Exception:
+        return None
+
+
+def _location_key_from_rounded(level_value, rounded_point, include_z=True):
+    if not rounded_point:
+        return None
+
+    level_text = _collapse_whitespace(level_value) or "unknown"
+    parts = [
+        "L{}".format(level_text),
+        "{:.3f}".format(float(rounded_point["x_mm"])),
+        "{:.3f}".format(float(rounded_point["y_mm"])),
+    ]
+    if include_z:
+        parts.append("{:.3f}".format(float(rounded_point["z_mm"])))
+    return "|".join(parts)
+
+
+def _location_point_from_element(element):
+    try:
+        location = getattr(element, "Location", None)
+    except Exception:
+        location = None
+
+    if not location:
+        return None, None
+
+    try:
+        point = getattr(location, "Point", None)
+        if point:
+            return point, "location_point"
+    except Exception:
+        pass
+
+    try:
+        curve = getattr(location, "Curve", None)
+        if curve:
+            return curve.Evaluate(0.5, True), "location_curve_midpoint"
+    except Exception:
+        pass
+
+    return None, None
+
+
+def _bounding_box_corners(bbox):
+    corners = []
+    if not bbox:
+        return corners
+
+    try:
+        transform = getattr(bbox, "Transform", None) or DB.Transform.Identity
+    except Exception:
+        transform = None
+
+    min_pt = bbox.Min
+    max_pt = bbox.Max
+    for x in (min_pt.X, max_pt.X):
+        for y in (min_pt.Y, max_pt.Y):
+            for z in (min_pt.Z, max_pt.Z):
+                corner = DB.XYZ(x, y, z)
+                if transform:
+                    try:
+                        corner = transform.OfPoint(corner)
+                    except Exception:
+                        pass
+                corners.append(corner)
+    return corners
+
+
+def _bounding_box_payload(element):
+    try:
+        bbox = element.get_BoundingBox(None)
+    except Exception:
+        bbox = None
+
+    corners = _bounding_box_corners(bbox)
+    if not corners:
+        return None
+
+    min_x = min(point.X for point in corners)
+    min_y = min(point.Y for point in corners)
+    min_z = min(point.Z for point in corners)
+    max_x = max(point.X for point in corners)
+    max_y = max(point.Y for point in corners)
+    max_z = max(point.Z for point in corners)
+    center = DB.XYZ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0, (min_z + max_z) / 2.0)
+
+    return {
+        "min": _xyz_payload(DB.XYZ(min_x, min_y, min_z)),
+        "max": _xyz_payload(DB.XYZ(max_x, max_y, max_z)),
+        "center": _xyz_payload(center),
+    }
+
+
+def _location_candidate_for_element(element, include_bounding_box=True):
+    point, source = _location_point_from_element(element)
+    bbox = _bounding_box_payload(element) if include_bounding_box else None
+
+    if point:
+        return {
+            "point": _xyz_payload(point),
+            "source": source,
+            "bounding_box": bbox,
+        }
+
+    if bbox and bbox.get("center"):
+        return {
+            "point": bbox.get("center"),
+            "source": "bounding_box_center",
+            "bounding_box": bbox,
+        }
+
+    return {
+        "point": None,
+        "source": None,
+        "bounding_box": bbox,
+    }
+
+
+def _element_location_metadata(element, doc):
+    metadata = {}
+
+    for param_name in ("Install Level", "Comments"):
+        try:
+            param = _find_parameter(element, param_name, doc=doc, include_type=True)
+            display_value = _get_parameter_display_value(param, doc) if param else None
+            if _is_meaningful_value(display_value):
+                metadata[param_name] = display_value
+        except Exception:
+            pass
+
+    level_name = _get_element_level_name(element, doc)
+    if level_name:
+        metadata["Level"] = level_name
+
+    return metadata
+
+
+def _element_location_record(element, doc, include_bounding_box=True, include_fallbacks=True, rounding_precision_mm=1.0):
+    metadata = _element_location_metadata(element, doc)
+    candidate = _location_candidate_for_element(element, include_bounding_box=include_bounding_box)
+    fallback_element = None
+    fallback_relationship = None
+
+    if not candidate.get("point") and include_fallbacks:
+        parent, relationship = _next_parent_relationship(element)
+        if parent:
+            parent_candidate = _location_candidate_for_element(parent, include_bounding_box=include_bounding_box)
+            if parent_candidate.get("point"):
+                candidate = parent_candidate
+                fallback_element = _element_ref_summary(parent, doc, relationship=relationship)
+                fallback_relationship = relationship
+
+    rounded_point = _rounded_mm_payload(candidate.get("point"), rounding_precision_mm)
+    install_level = metadata.get("Install Level") or metadata.get("Level")
+
+    record = {
+        "element": _element_ref_summary(element, doc),
+        "metadata": metadata,
+        "point": candidate.get("point"),
+        "rounded_point_mm": rounded_point,
+        "location_source": candidate.get("source"),
+        "xy_overlap_key": _location_key_from_rounded(install_level, rounded_point, include_z=False),
+        "xyz_overlap_key": _location_key_from_rounded(install_level, rounded_point, include_z=True),
+    }
+
+    if include_bounding_box:
+        record["bounding_box"] = candidate.get("bounding_box")
+
+    if fallback_element:
+        record["fallback_element"] = fallback_element
+        record["fallback_relationship"] = fallback_relationship
+        record["location_source"] = "{}_{}".format(fallback_relationship, candidate.get("source"))
+
+    if not record.get("point"):
+        record["location_error"] = "No Location point, Location curve, bounding box, or parent fallback location was available."
+
+    return record
+
+
+def _element_ref_summary(element, doc, relationship=None):
+    if not element:
+        return None
+    summary = _build_element_summary(element, doc)
+    try:
+        type_id = element.GetTypeId()
+        type_id_text = _safe_element_id_text(type_id)
+        if type_id_text:
+            summary["type_id"] = type_id_text
+    except Exception:
+        pass
+    try:
+        owner_view_id = getattr(element, "OwnerViewId", None)
+        owner_view_id_text = _safe_element_id_text(owner_view_id)
+        if owner_view_id_text:
+            summary["owner_view_id"] = owner_view_id_text
+    except Exception:
+        pass
+    if relationship:
+        summary["relationship"] = relationship
+    return summary
+
+
+def _element_ids_to_summaries(doc, element_ids, relationship, limit):
+    summaries = []
+    total = 0
+    try:
+        total = int(element_ids.Count)
+    except Exception:
+        try:
+            total = len(list(element_ids))
+        except Exception:
+            total = 0
+
+    for element_id in element_ids:
+        if len(summaries) >= limit:
+            break
+        try:
+            element = doc.GetElement(element_id)
+            if element:
+                summary = _element_ref_summary(element, doc, relationship=relationship)
+                if summary:
+                    summaries.append(summary)
+        except Exception:
+            continue
+
+    return {
+        "total_count": total,
+        "returned_count": len(summaries),
+        "truncated": total > len(summaries),
+        "elements": summaries,
+    }
+
+
+def _get_direct_host(element):
+    try:
+        host = getattr(element, "Host", None)
+        if host:
+            return host
+    except Exception:
+        pass
+    return None
+
+
+def _get_super_component(element):
+    try:
+        super_component = getattr(element, "SuperComponent", None)
+        if super_component:
+            return super_component
+    except Exception:
+        pass
+    return None
+
+
+def _next_parent_relationship(element):
+    host = _get_direct_host(element)
+    if host:
+        return host, "host"
+    super_component = _get_super_component(element)
+    if super_component:
+        return super_component, "super_component"
+    return None, None
+
+
+def _build_host_chain(element, doc, max_depth):
+    chain = []
+    visited = set()
+    current = element
+
+    for _index in range(max_depth):
+        parent, relationship = _next_parent_relationship(current)
+        if not parent:
+            break
+        parent_id = _safe_element_id_text(parent.Id)
+        if not parent_id or parent_id in visited:
+            break
+        visited.add(parent_id)
+        summary = _element_ref_summary(parent, doc, relationship=relationship)
+        if summary:
+            chain.append(summary)
+        current = parent
+
+    return chain
+
+
+def _adaptive_placement_points(element, doc):
+    points = []
+    utils = getattr(DB, "AdaptiveComponentInstanceUtils", None)
+    if not utils:
+        return points
+
+    try:
+        point_ids = utils.GetInstancePlacementPointElementRefIds(element)
+    except Exception:
+        return points
+
+    for index, point_id in enumerate(point_ids):
+        point_summary = {
+            "index": index,
+            "point_element_id": _safe_element_id_text(point_id),
+            "position": None,
+        }
+        try:
+            point = doc.GetElement(point_id)
+            if point:
+                point_summary["point"] = _element_ref_summary(point, doc, relationship="adaptive_placement_point")
+                position = getattr(point, "Position", None)
+                point_summary["position"] = _safe_xyz_summary(position)
+        except Exception:
+            pass
+        points.append(point_summary)
+
+    return points
+
+
+def _relationship_record_for_element(
+    element,
+    doc,
+    include_host_chain=True,
+    include_children=True,
+    include_dependents=False,
+    include_adaptive_points=True,
+    max_depth=3,
+    max_children=100,
+):
+    record = {
+        "element": _element_ref_summary(element, doc),
+        "host": None,
+        "super_component": None,
+        "host_chain": [],
+        "sub_components": {"total_count": 0, "returned_count": 0, "truncated": False, "elements": []},
+        "hosted_inserts": {"total_count": 0, "returned_count": 0, "truncated": False, "elements": []},
+        "dependents": {"total_count": 0, "returned_count": 0, "truncated": False, "elements": []},
+        "adaptive_placement_points": [],
+    }
+
+    host = _get_direct_host(element)
+    if host:
+        record["host"] = _element_ref_summary(host, doc, relationship="host")
+
+    super_component = _get_super_component(element)
+    if super_component:
+        record["super_component"] = _element_ref_summary(super_component, doc, relationship="super_component")
+
+    try:
+        group_id_text = _safe_element_id_text(getattr(element, "GroupId", None))
+        if group_id_text:
+            group = doc.GetElement(element.GroupId)
+            if group:
+                record["group"] = _element_ref_summary(group, doc, relationship="group")
+    except Exception:
+        pass
+
+    try:
+        assembly_id_text = _safe_element_id_text(getattr(element, "AssemblyInstanceId", None))
+        if assembly_id_text:
+            assembly = doc.GetElement(element.AssemblyInstanceId)
+            if assembly:
+                record["assembly"] = _element_ref_summary(assembly, doc, relationship="assembly")
+    except Exception:
+        pass
+
+    if include_host_chain:
+        record["host_chain"] = _build_host_chain(element, doc, max_depth=max_depth)
+
+    if include_adaptive_points:
+        record["adaptive_placement_points"] = _adaptive_placement_points(element, doc)
+
+    if include_children:
+        try:
+            sub_component_ids = element.GetSubComponentIds()
+            record["sub_components"] = _element_ids_to_summaries(
+                doc,
+                sub_component_ids,
+                relationship="sub_component",
+                limit=max_children,
+            )
+        except Exception:
+            pass
+
+        try:
+            find_inserts = getattr(element, "FindInserts", None)
+            if find_inserts:
+                insert_ids = find_inserts(True, True, True, True)
+                record["hosted_inserts"] = _element_ids_to_summaries(
+                    doc,
+                    insert_ids,
+                    relationship="hosted_insert",
+                    limit=max_children,
+                )
+        except Exception:
+            pass
+
+    if include_dependents:
+        try:
+            dependent_ids = element.GetDependentElements(None)
+            record["dependents"] = _element_ids_to_summaries(
+                doc,
+                dependent_ids,
+                relationship="dependent",
+                limit=max_children,
+            )
+        except Exception:
+            pass
+
+    return record
+
+
+def register_routes(api):
+    """Register all element-related routes with the API"""
+
+    @api.route('/views/active/info', methods=['GET'])
+    def handle_get_active_view_info(uidoc, doc, request):
+        route_logger = script.get_logger()
+
+        try:
+            active_view = uidoc.ActiveView
+
+            if not active_view:
+                return routes.Response(status=503, data={"error": "No active Revit view"})
+
+            associated_level = None
+            try:
+                gen_level = getattr(active_view, "GenLevel", None)
+                if gen_level and hasattr(gen_level, "Name") and gen_level.Name:
+                    associated_level = gen_level.Name
+            except Exception:
+                associated_level = None
+
+            if not associated_level:
+                try:
+                    level_id = getattr(active_view, "LevelId", DB.ElementId.InvalidElementId)
+                    if level_id and level_id != DB.ElementId.InvalidElementId:
+                        level = doc.GetElement(level_id)
+                        if level and hasattr(level, "Name") and level.Name:
+                            associated_level = level.Name
+                except Exception:
+                    associated_level = None
+
+            view_info = {
+                "id": _safe_element_id_text(active_view.Id),
+                "name": active_view.Name,
+                "type": str(active_view.ViewType),
+                "scale": int(getattr(active_view, "Scale", 0) or 0),
+                "is_template": bool(getattr(active_view, "IsTemplate", False)),
+                "can_be_printed": bool(getattr(active_view, "CanBePrinted", False))
+            }
+
+            if associated_level:
+                view_info["associated_level"] = associated_level
+
+            try:
+                view_family = getattr(active_view, "ViewFamily", None)
+                if view_family is not None:
+                    view_info["family"] = str(view_family)
+            except Exception:
+                pass
+
+            try:
+                detail_level = getattr(active_view, "DetailLevel", None)
+                if detail_level is not None:
+                    view_info["detail_level"] = str(detail_level)
+            except Exception:
+                pass
+
+            try:
+                display_style = getattr(active_view, "DisplayStyle", None)
+                if display_style is not None:
+                    view_info["display_style"] = str(display_style)
+            except Exception:
+                pass
+
+            return {
+                "status": "success",
+                "message": "Retrieved active view metadata.",
+                "doc": {
+                    "title": doc.Title,
+                    "path": doc.PathName
+                },
+                "view": view_info
+            }
+
+        except Exception as e:
+            route_logger.error("Error in /views/active/info: {}".format(e), exc_info=True)
+            return routes.Response(status=500, data={"error": "Internal server error", "details": str(e)})
+
+    @api.route('/views/active/elements', methods=['POST'])
+    def handle_get_active_view_elements(uidoc, doc, request):
+        route_logger = script.get_logger()
+
+        try:
+            payload = request.data if hasattr(request, 'data') else {}
+            if payload is None:
+                payload = {}
+            if not isinstance(payload, dict):
+                return routes.Response(status=400, data={"error": "Invalid JSON payload"})
+
+            category_names = payload.get('category_names', []) or []
+            if isinstance(category_names, str):
+                category_names = [category_names]
+            elif not isinstance(category_names, list):
+                return routes.Response(status=400, data={"error": "'category_names' must be a list of strings"})
+
+            try:
+                limit = int(payload.get('limit', 200))
+            except Exception:
+                limit = 200
+            limit = max(1, min(2000, limit))
+
+            requested_categories = [_normalize_category_key(name) for name in category_names if str(name or "").strip()]
+
+            active_view = uidoc.ActiveView
+            if not active_view:
+                return routes.Response(status=503, data={"error": "No active Revit view"})
+
+            collector = DB.FilteredElementCollector(doc, active_view.Id).WhereElementIsNotElementType()
+
+            element_ids = []
+            elements = []
+            total_count = 0
+
+            for element in collector:
+                try:
+                    category_name = element.Category.Name if element.Category and element.Category.Name else ""
+                except Exception:
+                    category_name = ""
+
+                if requested_categories and _normalize_category_key(category_name) not in requested_categories:
+                    continue
+
+                total_count += 1
+                if len(element_ids) >= limit:
+                    continue
+
+                element_ids.append(_safe_element_id_text(element.Id))
+                elements.append(_build_element_summary(element, doc))
+
+            return {
+                "status": "success",
+                "message": "Found {} matching elements in the active view.".format(total_count),
+                "view": {
+                    "id": _safe_element_id_text(active_view.Id),
+                    "name": active_view.Name,
+                    "type": str(active_view.ViewType)
+                },
+                "category_filters": category_names,
+                "limit": limit,
+                "total_count": total_count,
+                "returned_count": len(element_ids),
+                "truncated": total_count > len(element_ids),
+                "element_ids": element_ids,
+                "elements": elements
+            }
+
+        except Exception as e:
+            route_logger.error("Error in /views/active/elements: {}".format(e), exc_info=True)
+            return routes.Response(status=500, data={"error": "Internal server error", "details": str(e)})
+
+    @api.route('/selection/active', methods=['POST'])
+    def handle_get_active_selection(uidoc, doc, request):
+        route_logger = script.get_logger()
+
+        try:
+            payload = request.data if hasattr(request, 'data') else {}
+            if payload is None:
+                payload = {}
+            if not isinstance(payload, dict):
+                return routes.Response(status=400, data={"error": "Invalid JSON payload"})
+
+            try:
+                limit = int(payload.get('limit', 200))
+            except Exception:
+                limit = 200
+            limit = max(1, min(2000, limit))
+
+            selected_ids = uidoc.Selection.GetElementIds()
+
+            element_ids = []
+            elements = []
+            total_count = 0
+
+            for elem_id in selected_ids:
+                total_count += 1
+                if len(element_ids) >= limit:
+                    continue
+
+                element = doc.GetElement(elem_id)
+                if not element:
+                    continue
+
+                element_ids.append(_safe_element_id_text(elem_id))
+                elements.append(_build_element_summary(element, doc))
+
+            return {
+                "status": "success",
+                "message": "Read {} elements from the current Revit selection.".format(total_count),
+                "limit": limit,
+                "total_count": total_count,
+                "returned_count": len(element_ids),
+                "truncated": total_count > len(element_ids),
+                "element_ids": element_ids,
+                "elements": elements
+            }
+
+        except Exception as e:
+            route_logger.error("Error in /selection/active: {}".format(e), exc_info=True)
+            return routes.Response(status=500, data={"error": "Internal server error", "details": str(e)})
+
+    @api.route('/families/types', methods=['POST'])
+    def handle_list_family_types(doc, request):
+        route_logger = script.get_logger()
+
+        try:
+            payload = request.data if hasattr(request, 'data') else {}
+            if payload is None:
+                payload = {}
+            if not isinstance(payload, dict):
+                return routes.Response(status=400, data={"error": "Invalid JSON payload"})
+
+            category_names = payload.get('category_names', []) or []
+            if isinstance(category_names, str):
+                category_names = [category_names]
+            elif not isinstance(category_names, list):
+                return routes.Response(status=400, data={"error": "'category_names' must be a list of strings"})
+
+            family_name_contains = str(payload.get('family_name_contains') or "").strip().lower()
+            type_name_contains = str(payload.get('type_name_contains') or "").strip().lower()
+
+            try:
+                limit = int(payload.get('limit', 150))
+            except Exception:
+                limit = 150
+            limit = max(1, min(2000, limit))
+
+            requested_categories = [_normalize_category_key(name) for name in category_names if str(name or "").strip()]
+
+            symbols = DB.FilteredElementCollector(doc).OfClass(DB.FamilySymbol).ToElements()
+
+            family_types = []
+            total_count = 0
+
+            for symbol in symbols:
+                try:
+                    family = getattr(symbol, "Family", None)
+                    family_name = family.Name if family and hasattr(family, "Name") and family.Name else ""
+                    type_name = symbol.Name if hasattr(symbol, "Name") and symbol.Name else ""
+                    category = getattr(symbol, "Category", None)
+                    category_name = category.Name if category and hasattr(category, "Name") and category.Name else ""
+
+                    if requested_categories and _normalize_category_key(category_name) not in requested_categories:
+                        continue
+                    if family_name_contains and family_name_contains not in family_name.lower():
+                        continue
+                    if type_name_contains and type_name_contains not in type_name.lower():
+                        continue
+
+                    total_count += 1
+                    if len(family_types) >= limit:
+                        continue
+
+                    family_types.append({
+                        "symbol_id": _safe_element_id_text(symbol.Id),
+                        "category": category_name or "No Category",
+                        "family_name": family_name or "Unnamed Family",
+                        "type_name": type_name or "Unnamed Type",
+                        "family_and_type": "{} : {}".format(family_name or "Unnamed Family", type_name or "Unnamed Type"),
+                        "is_active": bool(getattr(symbol, "IsActive", False))
+                    })
+                except Exception:
+                    continue
+
+            return {
+                "status": "success",
+                "message": "Matched {} family types in the current document.".format(total_count),
+                "category_filters": category_names,
+                "family_name_contains": payload.get('family_name_contains'),
+                "type_name_contains": payload.get('type_name_contains'),
+                "limit": limit,
+                "total_count": total_count,
+                "returned_count": len(family_types),
+                "truncated": total_count > len(family_types),
+                "family_types": family_types
+            }
+
+        except Exception as e:
+            route_logger.error("Error in /families/types: {}".format(e), exc_info=True)
+            return routes.Response(status=500, data={"error": "Internal server error", "details": str(e)})
+
+    @api.route('/get_elements_by_category', methods=['POST'])
+    def handle_get_elements_by_category(doc, request):
+        """
+        Handles POST requests to /revit-mcp-v1/get_elements_by_category
+        Returns elements in Revit by category name (without selecting them).
+        """
+        route_logger = script.get_logger()
+
+        if not request:
+            route_logger.error("Critical error: 'request' object is None.")
+            return routes.Response(status=500, data={"error": "Internal server error: 'request' object is None.", "details": "The 'request' object was not provided to the handler by pyRevit."})
+
+        try:
+            payload = request.data if hasattr(request, 'data') else None
+            route_logger.info("Successfully accessed request.data. Type: {}, Value: {}".format(type(payload), payload))
+
+            if not payload or not isinstance(payload, dict):
+                route_logger.error("Request body (payload) is missing or not a valid JSON object.")
+                return routes.Response(status=400, data={"error": "Request body is missing or not a valid JSON object."})
+
+            category_name_payload = payload.get('category_name')
+
+            if not category_name_payload:
+                route_logger.error("Missing 'category_name' in JSON body for /get_elements_by_category.")
+                return routes.Response(status=400, data={"error": "Missing 'category_name' in JSON request body."})
+
+            built_in_category = _resolve_built_in_category(category_name_payload, route_logger, doc=doc)
+            if not built_in_category:
+                route_logger.error("Invalid category_name: '{}'. Not a recognized BuiltInCategory.".format(category_name_payload))
+                return routes.Response(
+                    status=400,
+                    data={
+                        "error": "Invalid category_name: '{}'.".format(category_name_payload),
+                        "suggestions": _suggest_category_names(doc, category_name_payload),
+                    },
+                )
+
+            # Use ToElementIds() for better performance - no need for ToElements()
+            element_ids_collector = DB.FilteredElementCollector(doc)\
+                                       .OfCategory(built_in_category)\
+                                       .WhereElementIsNotElementType()\
+                                       .ToElementIds()
+
+            element_ids = []
+            route_logger.info("Found {} elements in category '{}' using ToElementIds()".format(element_ids_collector.Count, category_name_payload))
+
+            # Convert ElementId objects to string list
+            for element_id in element_ids_collector:
+                element_ids.append(_safe_element_id_text(element_id))
+
+            if not element_ids:
+                route_logger.info("No elements found for category '{}' to return.".format(category_name_payload))
+                return {"status": "success", "message": "No elements found for category '{}'".format(category_name_payload), "count": 0, "element_ids": []}
+
+            route_logger.info("Successfully retrieved {} element IDs for category '{}'.".format(len(element_ids), category_name_payload))
+            return {
+                "status": "success",
+                "message": "{} elements found for category '{}'.".format(len(element_ids), category_name_payload),
+                "count": len(element_ids),
+                "category": category_name_payload,
+                "element_ids": element_ids
+            }
+
+        except Exception as e_main_logic:
+            route_logger.error("Critical error in /get_elements_by_category: {}".format(e_main_logic), exc_info=True)
+            return routes.Response(status=500, data={"error": "Internal server error during main logic.", "details": str(e_main_logic)})
+
+    @api.route('/select_elements_by_id', methods=['POST'])
+    def handle_select_elements_by_id(uidoc, doc, request):
+        return _perform_select_elements(uidoc, doc, request, script.get_logger())
+
+    @api.route('/select_elements_focused', methods=['POST'])
+    def handle_select_elements_focused(uidoc, doc, request):
+        return _perform_select_elements(uidoc, doc, request, script.get_logger())
+
+    @api.route('/elements/filter', methods=['POST'])
+    def handle_filter_elements(doc, request):
+        route_logger = script.get_logger()
+
+        try:
+            payload = request.data if hasattr(request, 'data') else None
+            if not payload or not isinstance(payload, dict):
+                return routes.Response(status=400, data={"error": "Invalid JSON payload"})
+
+            category_name = payload.get('category_name')
+            if not category_name:
+                return routes.Response(status=400, data={"error": "Missing 'category_name'"})
+
+            level_name = payload.get('level_name')
+            parameter_filters = payload.get('parameters', [])
+
+            built_in_category = _resolve_built_in_category(category_name, route_logger, doc=doc)
+            if not built_in_category:
+                return routes.Response(
+                    status=400,
+                    data={
+                        "error": "Invalid category_name: '{}'.".format(category_name),
+                        "suggestions": _suggest_category_names(doc, category_name),
+                    },
+                )
+
+            collector = DB.FilteredElementCollector(doc).OfCategory(built_in_category).WhereElementIsNotElementType()
+
+            if level_name:
+                levels = DB.FilteredElementCollector(doc).OfClass(DB.Level).ToElements()
+                target_level = None
+                for level in levels:
+                    if level.Name == level_name or level.Name.lower() == str(level_name).lower():
+                        target_level = level
+                        break
+
+                if not target_level:
+                    level_names = [lvl.Name for lvl in levels]
+                    return routes.Response(
+                        status=400,
+                        data={
+                            "error": "Level '{}' not found".format(level_name),
+                            "available_levels": level_names[:50]
+                        }
+                    )
+
+                collector = collector.WherePasses(DB.ElementLevelFilter(target_level.Id))
+
+            elements = collector.ToElements()
+            route_logger.info("Found {} elements before parameter filtering".format(len(elements)))
+
+            filtered_elements = []
+            filter_error = None
+            for element in elements:
+                include_element = True
+
+                for param_filter in parameter_filters:
+                    param_name = param_filter.get('name')
+                    expected_value = param_filter.get('value')
+                    condition = param_filter.get('operator') or param_filter.get('condition') or 'equals'
+
+                    if not param_name or expected_value is None:
+                        continue
+
+                    param = _find_parameter(element, param_name, doc=doc, include_type=True)
+                    matched, filter_error = _evaluate_parameter_filter(param, expected_value, condition, doc)
+                    if filter_error:
+                        break
+
+                    if not matched:
+                        include_element = False
+                        break
+
+                if filter_error:
+                    return routes.Response(status=400, data={"error": filter_error})
+
+                if include_element:
+                    filtered_elements.append(element)
+
+            element_ids = [_safe_element_id_text(elem.Id) for elem in filtered_elements]
+
+            return {
+                "status": "success",
+                "message": "Found {} elements matching filter criteria.".format(len(element_ids)),
+                "count": len(element_ids),
+                "category": category_name,
+                "level": level_name if level_name else "Any",
+                "parameter_filters": parameter_filters,
+                "element_ids": element_ids
+            }
+
+        except Exception as e:
+            route_logger.error("Error in /elements/filter: {}".format(e), exc_info=True)
+            return routes.Response(status=500, data={"error": "Internal server error", "details": str(e)})
+
+    @api.route('/elements/get_properties', methods=['POST'])
+    def handle_get_element_properties(doc, request):
+        route_logger = script.get_logger()
+
+        try:
+            payload = request.data if hasattr(request, 'data') else None
+            if not payload or not isinstance(payload, dict):
+                return routes.Response(status=400, data={"error": "Invalid JSON payload"})
+
+            element_ids_list = payload.get('element_ids')
+            if not element_ids_list:
+                return routes.Response(status=400, data={"error": "Missing 'element_ids'"})
+
+            parameter_names = payload.get('parameter_names', [])
+            include_all_parameters = bool(payload.get('include_all_parameters', False))
+            populated_only = bool(payload.get('populated_only', False))
+
+            results = []
+
+            for id_str in element_ids_list:
+                try:
+                    element = doc.GetElement(make_element_id(DB, id_str))
+                    if not element:
+                        results.append({"element_id": id_str, "error": "Element not found", "properties": {}, "typed_properties": {}})
+                        continue
+
+                    properties = {}
+                    typed_properties = {}
+
+                    if include_all_parameters:
+                        # Discover instance parameters first.
+                        for p in element.Parameters:
+                            try:
+                                if not p or not p.Definition or not p.Definition.Name:
+                                    continue
+                                pname = p.Definition.Name
+                                _append_parameter_property(properties, typed_properties, pname, p, doc, populated_only=populated_only)
+                            except Exception:
+                                continue
+
+                        # Include type parameters as fallback discovery source.
+                        try:
+                            symbol = getattr(element, "Symbol", None)
+                            if symbol:
+                                for p in symbol.Parameters:
+                                    try:
+                                        if not p or not p.Definition or not p.Definition.Name:
+                                            continue
+                                        pname = p.Definition.Name
+                                        pvalue = _get_parameter_display_value(p, doc)
+                                        if populated_only and not _is_meaningful_value(pvalue):
+                                            continue
+                                        if pname not in properties or not _is_meaningful_value(properties.get(pname)):
+                                            _append_parameter_property(
+                                                properties,
+                                                typed_properties,
+                                                pname,
+                                                p,
+                                                doc,
+                                                populated_only=populated_only,
+                                            )
+                                    except Exception:
+                                        continue
+                        except Exception:
+                            pass
+
+                    elif not parameter_names:
+                        category_name = element.Category.Name if element.Category else ""
+                        common_params = ["Level", "Family and Type", "Comments"]
+                        if category_name == "Windows":
+                            common_params.extend(["Sill Height", "Head Height", "Width", "Height"])
+                        elif category_name == "Doors":
+                            common_params.extend(["Width", "Height", "Finish"])
+                        elif category_name == "Walls":
+                            common_params.extend(["Base Constraint", "Top Constraint", "Height"])
+                        names_to_use = common_params
+                    else:
+                        names_to_use = parameter_names
+
+                    if not include_all_parameters:
+                        for param_name in names_to_use:
+                            param = _find_parameter(element, param_name, doc=doc, include_type=True)
+                            _append_parameter_property(properties, typed_properties, param_name, param, doc)
+
+                    # Enrich with stable, human-readable identity values.
+                    try:
+                        if hasattr(element, "Symbol") and element.Symbol:
+                            symbol = element.Symbol
+                            family = symbol.Family
+                            properties["Family Name"] = family.Name if family else "Not available"
+                            properties["Type Name"] = symbol.Name
+                            if family and symbol.Name:
+                                properties["Family and Type"] = "{} : {}".format(family.Name, symbol.Name)
+                    except Exception:
+                        pass
+
+                    properties["Element_Name"] = getattr(element, 'Name', 'No Name')
+                    properties["Category"] = element.Category.Name if element.Category else "No Category"
+                    properties["available_parameter_names"] = sorted(
+                        [k for k, v in properties.items() if _is_meaningful_value(v) and k not in ("available_parameter_names", "Element_Name", "Category")]
+                    )
+
+                    results.append({"element_id": id_str, "properties": properties, "typed_properties": typed_properties})
+
+                except Exception as elem_error:
+                    route_logger.warning("Error processing element {}: {}".format(id_str, elem_error))
+                    results.append({"element_id": id_str, "error": str(elem_error), "properties": {}, "typed_properties": {}})
+
+            return sanitize_for_json({
+                "status": "success",
+                "message": "Retrieved properties for {} elements".format(len(results)),
+                "count": len(results),
+                "elements": results
+            })
+
+        except Exception as e:
+            route_logger.error("Error in /elements/get_properties: {}".format(e), exc_info=True)
+            return routes.Response(status=500, data={"error": "Internal server error", "details": str(e)})
+
+    @api.route('/elements/relationships', methods=['POST'])
+    def handle_get_element_relationships(doc, request):
+        route_logger = script.get_logger()
+
+        try:
+            payload = request.data if hasattr(request, 'data') else None
+            if not payload or not isinstance(payload, dict):
+                return routes.Response(status=400, data={"status": "error", "error": "Invalid JSON payload"})
+
+            element_ids_list = payload.get('element_ids')
+            if not element_ids_list:
+                return routes.Response(status=400, data={"status": "error", "error": "Missing 'element_ids'"})
+
+            include_host_chain = _coerce_bool(payload.get("include_host_chain"), default=True)
+            include_children = _coerce_bool(payload.get("include_children"), default=True)
+            include_dependents = _coerce_bool(payload.get("include_dependents"), default=False)
+            include_adaptive_points = _coerce_bool(payload.get("include_adaptive_points"), default=True)
+            max_depth = _bounded_int(payload.get("max_depth"), 3, min_value=1, max_value=20)
+            max_children = _bounded_int(payload.get("max_children"), 100, min_value=0, max_value=1000)
+
+            results = []
+            missing_ids = []
+            invalid_ids = []
+
+            for id_value in element_ids_list:
+                id_text = str(id_value).strip()
+                try:
+                    element_id = make_element_id(DB, id_text)
+                except Exception:
+                    invalid_ids.append(id_text)
+                    results.append({
+                        "element_id": id_text,
+                        "status": "error",
+                        "error": "Invalid element id.",
+                    })
+                    continue
+
+                try:
+                    element = doc.GetElement(element_id)
+                    if not element:
+                        missing_ids.append(id_text)
+                        results.append({
+                            "element_id": id_text,
+                            "status": "error",
+                            "error": "Element not found.",
+                        })
+                        continue
+
+                    record = _relationship_record_for_element(
+                        element,
+                        doc,
+                        include_host_chain=include_host_chain,
+                        include_children=include_children,
+                        include_dependents=include_dependents,
+                        include_adaptive_points=include_adaptive_points,
+                        max_depth=max_depth,
+                        max_children=max_children,
+                    )
+                    record["element_id"] = id_text
+                    record["status"] = "success"
+                    results.append(record)
+                except Exception as elem_error:
+                    route_logger.warning("Error reading relationships for element {}: {}".format(id_text, elem_error))
+                    results.append({
+                        "element_id": id_text,
+                        "status": "error",
+                        "error": str(elem_error),
+                    })
+
+            return sanitize_for_json({
+                "status": "success",
+                "message": "Retrieved relationships for {} requested elements.".format(len(element_ids_list)),
+                "count": len(results),
+                "relationships": results,
+                "missing_ids": missing_ids,
+                "invalid_ids": invalid_ids,
+                "options": {
+                    "include_host_chain": include_host_chain,
+                    "include_children": include_children,
+                    "include_dependents": include_dependents,
+                    "include_adaptive_points": include_adaptive_points,
+                    "max_depth": max_depth,
+                    "max_children": max_children,
+                },
+            })
+
+        except Exception as e:
+            route_logger.error("Error in /elements/relationships: {}".format(e), exc_info=True)
+            return routes.Response(
+                status=500,
+                data=sanitize_for_json({
+                    "status": "error",
+                    "error": "Internal server error while reading element relationships.",
+                    "details": str(e),
+                }),
+            )
+
+    @api.route('/elements/locations', methods=['POST'])
+    def handle_get_element_locations(doc, request):
+        route_logger = script.get_logger()
+
+        try:
+            payload = request.data if hasattr(request, 'data') else None
+            if not payload or not isinstance(payload, dict):
+                return routes.Response(status=400, data={"status": "error", "error": "Invalid JSON payload"})
+
+            element_ids_list = payload.get('element_ids')
+            if not element_ids_list:
+                return routes.Response(status=400, data={"status": "error", "error": "Missing 'element_ids'"})
+
+            include_bounding_box = _coerce_bool(payload.get("include_bounding_box"), default=True)
+            include_fallbacks = _coerce_bool(payload.get("include_fallbacks"), default=True)
+            try:
+                rounding_precision_mm = float(payload.get("rounding_precision_mm", 1.0))
+            except Exception:
+                rounding_precision_mm = 1.0
+            if rounding_precision_mm < 0:
+                rounding_precision_mm = 0.0
+            if rounding_precision_mm > 10000:
+                rounding_precision_mm = 10000.0
+
+            results = []
+            missing_ids = []
+            invalid_ids = []
+
+            for id_value in element_ids_list:
+                id_text = str(id_value).strip()
+                try:
+                    element_id = make_element_id(DB, id_text)
+                except Exception:
+                    invalid_ids.append(id_text)
+                    results.append({
+                        "element_id": id_text,
+                        "status": "error",
+                        "error": "Invalid element id.",
+                    })
+                    continue
+
+                try:
+                    element = doc.GetElement(element_id)
+                    if not element:
+                        missing_ids.append(id_text)
+                        results.append({
+                            "element_id": id_text,
+                            "status": "error",
+                            "error": "Element not found.",
+                        })
+                        continue
+
+                    record = _element_location_record(
+                        element,
+                        doc,
+                        include_bounding_box=include_bounding_box,
+                        include_fallbacks=include_fallbacks,
+                        rounding_precision_mm=rounding_precision_mm,
+                    )
+                    record["element_id"] = id_text
+                    record["status"] = "success"
+                    results.append(record)
+                except Exception as elem_error:
+                    route_logger.warning("Error reading location for element {}: {}".format(id_text, elem_error))
+                    results.append({
+                        "element_id": id_text,
+                        "status": "error",
+                        "error": str(elem_error),
+                    })
+
+            return sanitize_for_json({
+                "status": "success",
+                "message": "Retrieved locations for {} requested elements.".format(len(element_ids_list)),
+                "count": len(results),
+                "locations": results,
+                "missing_ids": missing_ids,
+                "invalid_ids": invalid_ids,
+                "options": {
+                    "include_bounding_box": include_bounding_box,
+                    "include_fallbacks": include_fallbacks,
+                    "rounding_precision_mm": rounding_precision_mm,
+                },
+            })
+
+        except Exception as e:
+            route_logger.error("Error in /elements/locations: {}".format(e), exc_info=True)
+            return routes.Response(
+                status=500,
+                data=sanitize_for_json({
+                    "status": "error",
+                    "error": "Internal server error while reading element locations.",
+                    "details": str(e),
+                }),
+            )
+
+    @api.route('/elements/sync_parameters', methods=['POST'])
+    def handle_sync_element_parameter_values(uidoc, doc, request):
+        route_logger = script.get_logger()
+
+        try:
+            payload = request.data if hasattr(request, 'data') else None
+            if not payload or not isinstance(payload, dict):
+                return routes.Response(status=400, data={"status": "error", "error": "Invalid JSON payload"})
+
+            element_ids_list = payload.get("element_ids")
+            if not element_ids_list or not isinstance(element_ids_list, list):
+                return routes.Response(status=400, data={"status": "error", "error": "Missing 'element_ids' list"})
+
+            source_parameters = _normalize_parameter_name_list(payload.get("source_parameters"))
+            target_parameter = _collapse_whitespace(payload.get("target_parameter"))
+            if not source_parameters:
+                return routes.Response(status=400, data={"status": "error", "error": "Missing 'source_parameters' list"})
+            if not target_parameter:
+                return routes.Response(status=400, data={"status": "error", "error": "Missing 'target_parameter'"})
+
+            source_strategy = _normalize_sync_source_strategy(payload.get("source_strategy"))
+            if not source_strategy:
+                return routes.Response(
+                    status=400,
+                    data={
+                        "status": "error",
+                        "error": "Unsupported source_strategy.",
+                        "supported_source_strategies": ["first_populated"],
+                    },
+                )
+
+            target_policy = _normalize_sync_target_policy(payload.get("target_policy"))
+            if not target_policy:
+                return routes.Response(
+                    status=400,
+                    data={
+                        "status": "error",
+                        "error": "Unsupported target_policy.",
+                        "supported_target_policies": ["missing_only", "overwrite_all"],
+                    },
+                )
+
+            conflict_policy = _normalize_sync_conflict_policy(payload.get("conflict_policy"))
+            if not conflict_policy:
+                return routes.Response(
+                    status=400,
+                    data={
+                        "status": "error",
+                        "error": "Unsupported conflict_policy.",
+                        "supported_conflict_policies": ["use_first", "skip"],
+                    },
+                )
+
+            dry_run = _coerce_bool(payload.get("dry_run"), default=True)
+            include_type_parameters = _coerce_bool(payload.get("include_type_parameters"), default=True)
+            ignored_source_values = _normalize_ignored_source_values(payload.get("ignored_source_values"))
+            max_results = _bounded_int(payload.get("max_results"), 50, min_value=0, max_value=500)
+
+            results = []
+            conflict_samples = []
+            summary = {
+                "total": len(element_ids_list),
+                "updated": 0,
+                "would_update": 0,
+                "skipped_existing_target": 0,
+                "skipped_no_source_value": 0,
+                "skipped_conflicts": 0,
+                "missing_target_parameter": 0,
+                "read_only_target_parameter": 0,
+                "missing_elements": 0,
+                "invalid_element_ids": 0,
+                "errors": 0,
+                "conflicts": 0,
+            }
+
+            transaction = None
+            if not dry_run:
+                transaction = DB.Transaction(doc, "RevitMCP Sync Element Parameter Values")
+                try:
+                    transaction.Start()
+                except Exception as transaction_start_error:
+                    route_logger.error(
+                        "Could not start RevitMCP Sync Element Parameter Values transaction: {}".format(transaction_start_error),
+                        exc_info=True,
+                    )
+                    return routes.Response(
+                        status=409,
+                        data={
+                            "status": "error",
+                            "error": "Could not start Revit transaction.",
+                            "details": str(transaction_start_error),
+                            "document_state": sanitize_for_json(_get_document_write_state(doc, uidoc)),
+                        },
+                    )
+
+            try:
+                for id_value in element_ids_list:
+                    element_id_text = _collapse_whitespace(id_value)
+                    if not element_id_text:
+                        summary["invalid_element_ids"] += 1
+                        summary["errors"] += 1
+                        if len(results) < max_results:
+                            results.append(_sync_result_record(element_id_text, "error", "Invalid element id."))
+                        continue
+
+                    try:
+                        element_id = make_element_id(DB, element_id_text)
+                    except Exception:
+                        summary["invalid_element_ids"] += 1
+                        summary["errors"] += 1
+                        if len(results) < max_results:
+                            results.append(_sync_result_record(element_id_text, "error", "Invalid element id."))
+                        continue
+
+                    try:
+                        element = doc.GetElement(element_id)
+                        if not element:
+                            summary["missing_elements"] += 1
+                            summary["errors"] += 1
+                            if len(results) < max_results:
+                                results.append(_sync_result_record(element_id_text, "error", "Element not found."))
+                            continue
+
+                        target_param = _find_parameter(element, target_parameter)
+                        if not target_param:
+                            summary["missing_target_parameter"] += 1
+                            summary["errors"] += 1
+                            if len(results) < max_results:
+                                record = _sync_result_record(element_id_text, "error", "Target parameter not found.")
+                                record["target_parameter"] = target_parameter
+                                results.append(record)
+                            continue
+
+                        target_display_value = _get_parameter_display_value(target_param, doc)
+                        target_has_value = _is_meaningful_value(target_display_value)
+                        if target_policy == "missing_only" and target_has_value:
+                            summary["skipped_existing_target"] += 1
+                            if len(results) < max_results:
+                                record = _sync_result_record(element_id_text, "skipped", "Target already has a value.")
+                                record["target_parameter"] = target_parameter
+                                record["target_value"] = target_display_value
+                                results.append(record)
+                            continue
+
+                        populated_sources, missing_sources = _source_values_for_sync(
+                            element,
+                            doc,
+                            source_parameters,
+                            include_type_parameters,
+                            ignored_source_values=ignored_source_values,
+                        )
+                        if len(populated_sources) > 1:
+                            summary["conflicts"] += 1
+                            if len(conflict_samples) < 20:
+                                conflict_samples.append({
+                                    "element_id": element_id_text,
+                                    "populated_sources": populated_sources,
+                                })
+                            if conflict_policy == "skip":
+                                summary["skipped_conflicts"] += 1
+                                if len(results) < max_results:
+                                    record = _sync_result_record(element_id_text, "skipped", "Multiple populated source parameters were found.")
+                                    record["target_parameter"] = target_parameter
+                                    record["conflict"] = True
+                                    record["populated_sources"] = populated_sources
+                                    results.append(record)
+                                continue
+
+                        if not populated_sources:
+                            summary["skipped_no_source_value"] += 1
+                            if len(results) < max_results:
+                                record = _sync_result_record(element_id_text, "skipped", "No populated source parameter was found.")
+                                record["missing_sources"] = missing_sources
+                                results.append(record)
+                            continue
+
+                        if target_param.IsReadOnly:
+                            summary["read_only_target_parameter"] += 1
+                            summary["errors"] += 1
+                            if len(results) < max_results:
+                                record = _sync_result_record(element_id_text, "error", "Target parameter is read-only.")
+                                record["target_parameter"] = target_parameter
+                                record["source"] = populated_sources[0]
+                                results.append(record)
+                            continue
+
+                        selected_source = populated_sources[0]
+                        new_value = selected_source.get("value")
+
+                        if dry_run:
+                            summary["would_update"] += 1
+                            if len(results) < max_results:
+                                record = _sync_result_record(element_id_text, "would_update")
+                                record["target_parameter"] = target_parameter
+                                record["current_target_value"] = target_display_value
+                                record["source"] = selected_source
+                                if len(populated_sources) > 1:
+                                    record["conflict"] = True
+                                    record["populated_sources"] = populated_sources
+                                results.append(record)
+                            continue
+
+                        ok, err = _set_parameter_value(target_param, new_value)
+                        if ok:
+                            summary["updated"] += 1
+                            if len(results) < max_results:
+                                record = _sync_result_record(element_id_text, "updated")
+                                record["target_parameter"] = target_parameter
+                                record["previous_target_value"] = target_display_value
+                                record["source"] = selected_source
+                                if len(populated_sources) > 1:
+                                    record["conflict"] = True
+                                    record["populated_sources"] = populated_sources
+                                results.append(record)
+                        else:
+                            summary["errors"] += 1
+                            if len(results) < max_results:
+                                record = _sync_result_record(element_id_text, "error", err)
+                                record["target_parameter"] = target_parameter
+                                record["source"] = selected_source
+                                results.append(record)
+
+                    except Exception as element_error:
+                        route_logger.warning("Error syncing parameters for element {}: {}".format(element_id_text, element_error))
+                        summary["errors"] += 1
+                        if len(results) < max_results:
+                            results.append(_sync_result_record(element_id_text, "error", str(element_error)))
+
+                if transaction:
+                    transaction.Commit()
+
+            except Exception as transaction_error:
+                if transaction:
+                    try:
+                        transaction.RollBack()
+                    except Exception:
+                        pass
+                return routes.Response(
+                    status=500,
+                    data={
+                        "status": "error",
+                        "error": "Parameter sync transaction failed",
+                        "details": str(transaction_error),
+                        "document_state": sanitize_for_json(_get_document_write_state(doc, uidoc)),
+                    },
+                )
+
+            action_count = summary["would_update"] if dry_run else summary["updated"]
+            action_word = "would update" if dry_run else "updated"
+            response = {
+                "status": "success",
+                "message": "Parameter sync {} {} elements; {} skipped existing targets, {} skipped without source values, {} skipped conflicts, {} errors.".format(
+                    action_word,
+                    action_count,
+                    summary["skipped_existing_target"],
+                    summary["skipped_no_source_value"],
+                    summary["skipped_conflicts"],
+                    summary["errors"],
+                ),
+                "dry_run": dry_run,
+                "source_strategy": source_strategy,
+                "target_policy": target_policy,
+                "conflict_policy": conflict_policy,
+                "source_parameters": source_parameters,
+                "target_parameter": target_parameter,
+                "include_type_parameters": include_type_parameters,
+                "ignored_source_values": sorted(list(ignored_source_values)),
+                "summary": summary,
+                "results_sample": results,
+                "results_truncated": len(element_ids_list) > len(results),
+                "results_total": len(element_ids_list),
+                "conflict_samples": conflict_samples,
+            }
+            return sanitize_for_json(response)
+
+        except Exception as e:
+            route_logger.error("Error in /elements/sync_parameters: {}".format(e), exc_info=True)
+            return routes.Response(
+                status=500,
+                data={
+                    "status": "error",
+                    "error": "Internal server error in parameter sync handler",
+                    "details": str(e),
+                },
+            )
+
+    @api.route('/elements/update_parameters', methods=['POST'])
+    def handle_update_element_parameters(uidoc, doc, request):
+        route_logger = script.get_logger()
+
+        try:
+            payload = request.data if hasattr(request, 'data') else None
+            if not payload or not isinstance(payload, dict):
+                return routes.Response(status=400, data={"error": "Invalid JSON payload"})
+
+            updates_list = payload.get('updates')
+            if not updates_list:
+                return routes.Response(status=400, data={"error": "Missing 'updates' list"})
+
+            results = []
+            transaction = DB.Transaction(doc, "Update Element Parameters")
+            try:
+                transaction.Start()
+            except Exception as transaction_start_error:
+                route_logger.error(
+                    "Could not start Update Element Parameters transaction: {}".format(transaction_start_error),
+                    exc_info=True,
+                )
+                return routes.Response(
+                    status=409,
+                    data={
+                        "status": "error",
+                        "error": "Could not start Revit transaction.",
+                        "details": str(transaction_start_error),
+                        "document_state": sanitize_for_json(_get_document_write_state(doc, uidoc)),
+                    },
+                )
+
+            try:
+                for update_data in updates_list:
+                    element_id_str = update_data.get('element_id')
+                    parameters_to_update = update_data.get('parameters', {})
+
+                    if not element_id_str or not parameters_to_update:
+                        results.append({
+                            "element_id": element_id_str,
+                            "status": "error",
+                            "message": "Missing element_id or parameters",
+                            "updated_params": [],
+                            "errors": {}
+                        })
+                        continue
+
+                    try:
+                        element = doc.GetElement(make_element_id(DB, element_id_str))
+                        if not element:
+                            results.append({
+                                "element_id": element_id_str,
+                                "status": "error",
+                                "message": "Element not found",
+                                "updated_params": [],
+                                "errors": {}
+                            })
+                            continue
+
+                        updated_params = []
+                        errors = {}
+
+                        for param_name, new_value in parameters_to_update.items():
+                            param = _find_parameter(element, param_name)
+                            if not param:
+                                errors[param_name] = "Parameter not found"
+                                continue
+
+                            if param.IsReadOnly:
+                                errors[param_name] = "Parameter is read-only"
+                                continue
+
+                            ok, err = _set_parameter_value(param, new_value)
+                            if ok:
+                                updated_params.append(param_name)
+                            else:
+                                errors[param_name] = err
+
+                        if updated_params and not errors:
+                            status = "success"
+                            message = "All parameters updated successfully"
+                        elif updated_params and errors:
+                            status = "partial"
+                            message = "Some parameters updated, some failed"
+                        else:
+                            status = "error"
+                            message = "No parameters were updated"
+
+                        results.append({
+                            "element_id": element_id_str,
+                            "status": status,
+                            "message": message,
+                            "updated_params": updated_params,
+                            "errors": errors
+                        })
+
+                    except Exception as elem_error:
+                        route_logger.warning("Error updating element {}: {}".format(element_id_str, elem_error))
+                        results.append({
+                            "element_id": element_id_str,
+                            "status": "error",
+                            "message": str(elem_error),
+                            "updated_params": [],
+                            "errors": {}
+                        })
+
+                transaction.Commit()
+            except Exception as transaction_error:
+                try:
+                    transaction.RollBack()
+                except Exception:
+                    pass
+                return routes.Response(
+                    status=500,
+                    data={
+                        "error": "Transaction failed",
+                        "details": str(transaction_error),
+                        "document_state": sanitize_for_json(_get_document_write_state(doc, uidoc)),
+                    },
+                )
+
+            success_count = len([r for r in results if r["status"] == "success"])
+            partial_count = len([r for r in results if r["status"] == "partial"])
+            error_count = len([r for r in results if r["status"] == "error"])
+
+            return {
+                "status": "success",
+                "message": "Parameter update completed: {} success, {} partial, {} errors".format(success_count, partial_count, error_count),
+                "summary": {
+                    "total": len(results),
+                    "success": success_count,
+                    "partial": partial_count,
+                    "errors": error_count
+                },
+                "results": results
+            }
+
+        except Exception as e:
+            route_logger.error("Error in /elements/update_parameters: {}".format(e), exc_info=True)
+            return routes.Response(
+                status=500,
+                data={
+                    "status": "error",
+                    "error": "Internal server error in parameter update handler",
+                    "details": str(e),
+                },
+            )
